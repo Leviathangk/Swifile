@@ -183,6 +183,7 @@ private struct ColumnPanel: View, Equatable {
             ForEach(files) { file in
                 ColumnRow(
                     file: file,
+                    refreshToken: refreshToken,
                     activity: activity,
                     // 按下即选中：List 的选中由系统在 mouseUp 才提交，等它就慢半拍。
                     // 在行内手势按下那一刻直接选中并分发（目标状态幂等，mouseUp 时系统路径再来一次无害）。
@@ -294,6 +295,7 @@ private struct ColumnPanel: View, Equatable {
 
 private struct ColumnRow: View {
     let file: FileItem
+    let refreshToken: UInt64
     let activity: PaneActivity
     /// 按下即选中（展开下一列或记入窗格选中）
     let onSelect: () -> Void
@@ -306,6 +308,22 @@ private struct ColumnRow: View {
     @State private var lastClickPoint: CGPoint = .zero
 
     private static let iconSize: CGFloat = 16
+
+    private struct IconReloadKey: Hashable {
+        let url: URL
+        let version: Date?
+        let fileSize: Int64?
+        let refreshToken: UInt64
+    }
+
+    private var reloadKey: IconReloadKey {
+        IconReloadKey(
+            url: file.url,
+            version: file.modificationDate,
+            fileSize: file.size,
+            refreshToken: refreshToken
+        )
+    }
 
     var body: some View {
         HStack(spacing: 6) {
@@ -355,7 +373,7 @@ private struct ColumnRow: View {
                     }
                 }
         )
-        .task(id: file.url) { await loadIconIfNeeded() }
+        .task(id: reloadKey) { await loadIconIfNeeded() }
     }
 
     @ViewBuilder
@@ -373,16 +391,26 @@ private struct ColumnRow: View {
         }
     }
 
-    /// 行出现时取图标：命中缓存立即显示，未命中交给 IconService 排队。
+    /// 行出现或目录刷新时取图标：缓存键带修改时间，外部覆盖文件后会重新生成。
     private func loadIconIfNeeded() async {
-        guard icon == nil else { return }
         let path = file.url.path(percentEncoded: false)
-        if let cached = IconService.shared.cached(path: path, size: Self.iconSize) {
+        if let cached = IconService.shared.cached(
+            path: path,
+            size: Self.iconSize,
+            version: file.modificationDate,
+            fileSize: file.size
+        ) {
             icon = cached
             return
         }
         let priority: IconService.RequestPriority = activity.isActive ? .foreground : .background
-        let loaded = await IconService.shared.icon(for: path, size: Self.iconSize, priority: priority)
+        let loaded = await IconService.shared.icon(
+            for: path,
+            size: Self.iconSize,
+            version: file.modificationDate,
+            fileSize: file.size,
+            priority: priority
+        )
         guard !Task.isCancelled else { return }
         icon = loaded
     }

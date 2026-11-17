@@ -12,7 +12,7 @@
 <p align="center">
   <img alt="macOS 14+" src="https://img.shields.io/badge/macOS-14%2B-111111?logo=apple&logoColor=white">
   <img alt="Native" src="https://img.shields.io/badge/SwiftUI%20%2B%20AppKit-100%25%20native-0A84FF">
-  <img alt="DMG" src="https://img.shields.io/badge/DMG-2.9%20MB-2EA043">
+  <img alt="DMG" src="https://img.shields.io/badge/DMG-2.8%20MB-2EA043">
   <img alt="License" src="https://img.shields.io/badge/License-PolyForm%20NC%201.0-8957E5">
 </p>
 
@@ -26,12 +26,14 @@
 
 | 原生 | 轻量 | 高效 |
 |---|---|---|
-| 100% SwiftUI + AppKit，不套 Electron，不内嵌浏览器 | 安装包约 2.9 MB，启动快、占用低 | 后台读取目录 + 快照缓存 + 目录监听，操作不卡主线程 |
+| 100% SwiftUI + AppKit，不套 Electron，不内嵌浏览器 | 安装包约 2.8 MB，启动快、占用低 | 后台读取目录 + FSEvents 实时同步 + 快照缓存，操作不卡主线程 |
 
 ## 功能
 
 - **多窗格布局**：单窗格 / 双窗格 / 四窗格 / 一加二，每个窗格独立导航
 - **三种视图**：图标宫格、列表（支持行内展开目录）、分栏（Miller columns）
+- **实时同步**：FSEvents 监听当前目录与展开目录，访达里的增删改、改名会自动同步
+- **缩略图预览**：图片、PDF、视频、音频、文本和 Office 文档自动生成预览图标
 - **可编辑路径栏**：面包屑逐级跳转；点路径空白处或按 `⌘L` 直接输入路径，支持 `~`、相对路径和带引号路径
 - **暂存区**：拖入收集，多选后复制 / 移动到活动窗格，也可以直接拖出
 - **快速访问**：把常用文件或文件夹拖进来即可添加引用
@@ -48,7 +50,7 @@ Swifile 对个人和非商业用途免费，源码公开，可自行构建。
 
 ## 下载与安装
 
-当前版本：`1.0`，DMG 约 2.9 MB。
+当前版本：`1.1.0`，DMG 约 2.8 MB。更新内容见 [CHANGELOG](CHANGELOG.md)。
 
 1. 从 [GitHub Releases](https://github.com/Leviathangk/Swifile/releases/latest) 下载 DMG
 2. 打开 DMG，把 Swifile 拖进 Applications

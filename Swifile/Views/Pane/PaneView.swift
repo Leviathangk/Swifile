@@ -277,6 +277,12 @@ private struct PaneBodyView: View {
                 .padding(.horizontal, 20)
             Button("重试") { pane.refresh() }
                 .controlSize(.small)
+            if pane.isPermissionError {
+                Button("打开系统设置") {
+                    SystemPermissionChecker.openFilesAndFoldersSettings()
+                }
+                .controlSize(.small)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

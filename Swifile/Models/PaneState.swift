@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Observation
 
@@ -36,6 +37,7 @@ final class PaneState: Identifiable {
     private(set) var isLoading = false
     private(set) var hasLoadedOnce = false
     private(set) var errorMessage: String?
+    private(set) var isPermissionError = false
     private(set) var totalItemCount = 0
 
     @ObservationIgnored let selectionStore = SelectionStore()
@@ -79,10 +81,16 @@ final class PaneState: Identifiable {
     @ObservationIgnored private var historyIndex: Int
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var rebuildTask: Task<Void, Never>?
+    @ObservationIgnored private var externalRefreshTask: Task<Void, Never>?
+    @ObservationIgnored private var cacheValidationTask: Task<Void, Never>?
+    /// 根目录刚被删除时的复核任务：给同路径重建留一个合并窗口，避免直接退父。
+    @ObservationIgnored private var rootRecoveryTask: Task<Void, Never>?
     @ObservationIgnored private var loadToken: UInt64 = 0
     @ObservationIgnored private var rebuildToken: UInt64 = 0
     @ObservationIgnored private var suppressQueryChange = false
     @ObservationIgnored private let monitor = DirectoryMonitor()
+    /// 读取目录快照前记下的 FSEvents 事件 ID，读取完成后从该位置补事件。
+    @ObservationIgnored private var monitorSinceEventID: UInt64?
     /// 已原地展开的目录路径（列表视图用）
     @ObservationIgnored private var expandedPaths: Set<String> = []
     /// 展开目录的子项缓存，保持读取顺序，展示时按当前排序规则排
@@ -100,6 +108,11 @@ final class PaneState: Identifiable {
         self.snapshot = .empty(directory: normalized, showHidden: false)
         self.history = [normalized]
         self.historyIndex = 0
+    }
+
+    deinit {
+        // 先断开 FSEvents，再让 monitor 自己释放；避免回调持有正在销毁的窗格。
+        monitor.stop()
     }
 
     var canGoBack: Bool { historyIndex > 0 }
@@ -185,7 +198,7 @@ final class PaneState: Identifiable {
 
     /// 强制从文件系统重新读取当前目录。
     func refresh() {
-        loadCurrentDirectory(force: true)
+        refreshExternally()
     }
 
     /// 该目录当前是否处于原地展开状态。
@@ -229,7 +242,9 @@ final class PaneState: Identifiable {
                 let snapshot = try await FileSystemHelper.loadSnapshot(
                     at: url,
                     showHidden: hidden,
-                    useCache: true,
+                    // 展开是用户主动读取，强制绕过快照缓存；
+                    // 收起期间的外部变化可能没有对应事件，不能拿旧缓存充数。
+                    useCache: false,
                     priority: priority
                 )
                 guard let self else { return }
@@ -278,9 +293,17 @@ final class PaneState: Identifiable {
     }
 
     private func beginNavigation(to directory: URL) {
+        let directory = Self.normalizeDirectoryURL(directory)
         loadTask?.cancel()
         rebuildTask?.cancel()
+        externalRefreshTask?.cancel()
+        externalRefreshTask = nil
+        cacheValidationTask?.cancel()
+        cacheValidationTask = nil
+        rootRecoveryTask?.cancel()
+        rootRecoveryTask = nil
         monitor.stop()
+        monitorSinceEventID = DirectoryMonitor.currentEventID()
 
         currentDirectory = directory
         selectionStore.clear()
@@ -302,6 +325,8 @@ final class PaneState: Identifiable {
     }
 
     private func loadCurrentDirectory(force: Bool) {
+        cacheValidationTask?.cancel()
+        cacheValidationTask = nil
         loadTask?.cancel()
         loadToken &+= 1
         let token = loadToken
@@ -309,11 +334,19 @@ final class PaneState: Identifiable {
         let hidden = showHidden
         let priority: DirectoryLoadPriority = activity.isActive ? .foreground : .background
 
-        errorMessage = nil
+        // 首次加载（或监听安装失败后重试）从当前事件 ID 起补事件；
+        // 正常刷新沿用已运行的监听，不重置事件游标。
+        if monitor.watchedPath == nil, monitorSinceEventID == nil {
+            monitorSinceEventID = DirectoryMonitor.currentEventID()
+        }
+
+        // 重试期间保留错误页，直到新快照真正提交；否则会把过期列表又露出一帧。
         isLoading = true
 
         if !force, let cached = FileSystemHelper.cachedSnapshot(at: directory, showHidden: hidden) {
             apply(snapshot: cached, loadToken: token)
+            // 缓存只负责首帧；返回旧目录时再后台核对一次，避免把过期快照当实时数据。
+            scheduleCacheRevalidation(for: directory)
             return
         }
 
@@ -333,9 +366,24 @@ final class PaneState: Identifiable {
                 guard let self, token == self.loadToken else { return }
                 self.loadTask = nil
                 self.isLoading = false
-                if self.filteredFiles.isEmpty {
-                    self.errorMessage = error.localizedDescription
+                self.rebuildTask?.cancel()
+                self.rebuildTask = nil
+                self.rebuildToken &+= 1
+                self.selectionStore.clear()
+                self.totalItemCount = 0
+
+                if Self.isMissingDirectoryError(error) {
+                    // 删除目录时 FSEvents 可能先补一个普通事件，触发这次读取失败。
+                    // 不能立刻退父，统一交给复核窗口判断是否真的消失。
+                    self.scheduleRootMissingResolution()
+                    return
                 }
+
+                // 外部刷新失败时不能继续展示旧快照，否则用户会误以为目录没有变化。
+                self.isPermissionError = Self.isPermissionError(error)
+                self.errorMessage = self.isPermissionError
+                    ? "没有访问「\(self.displayName)」的权限。请在系统设置 → 隐私与安全性 → 文件与文件夹中检查 Swifile 的访问权限，或检查该文件夹本身的权限。"
+                    : error.localizedDescription
             }
         }
     }
@@ -351,8 +399,17 @@ final class PaneState: Identifiable {
         loadTask = nil
         snapshot = newSnapshot
         hasLoadedOnce = true
-        monitor.watch(currentDirectory) { [weak self] in
-            self?.refreshFromMonitor()
+        errorMessage = nil
+        isPermissionError = false
+        // 目录已经成功读到，说明删除只是一次瞬时窗口（或已恢复），取消待执行的退父。
+        rootRecoveryTask?.cancel()
+        rootRecoveryTask = nil
+        let since = monitorSinceEventID
+        monitorSinceEventID = nil
+        monitor.watch(currentDirectory, since: since) { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.handleDirectoryEvent(event)
+            }
         }
         scheduleContentRebuild(
             delayNanoseconds: 0,
@@ -361,13 +418,312 @@ final class PaneState: Identifiable {
         )
     }
 
+    /// 应用回到前台时兜底检查：监听若被系统延迟或安装失败，目录仍可能发生变化。
+    /// 失败状态不受 `hasLoadedOnce` 限制，授权恢复后切回应用会自动重试。
+    func refreshIfDirectoryChangedExternally() {
+        guard loadTask == nil else { return }
+        let directory = currentDirectory
+        let loadedAt = snapshot.loadedAt
+        let hasError = errorMessage != nil
+        let hasLoaded = hasLoadedOnce
+        let hasMonitor = monitor.watchedPath != nil
+        Task { [weak self] in
+            let state = await Task.detached(priority: .utility) {
+                let status = DirectoryMonitor.status(of: directory)
+                let modified = try? directory.resourceValues(
+                    forKeys: [.contentModificationDateKey]
+                ).contentModificationDate
+                return (status, modified)
+            }.value
+            guard let self, !Task.isCancelled,
+                  Self.pathKey(self.currentDirectory) == Self.pathKey(directory) else { return }
 
-    private func refreshFromMonitor() {
-        Task {
-            await FileSystemHelper.invalidateCache(for: currentDirectory)
-            guard !Task.isCancelled else { return }
-            loadCurrentDirectory(force: true)
+            switch state.0 {
+            case .missing:
+                self.scheduleRootMissingResolution()
+                return
+            case .denied, .other:
+                // 权限拒绝/网络卷瞬时异常交给真实读取流程展示错误，不能误判成目录删除。
+                self.refreshExternally()
+                return
+            case .directory:
+                break
+            }
+
+            // 监听没装上时目录 mtime 不可靠，直接重读一次。
+            if hasError || !hasLoaded || !hasMonitor {
+                self.refreshExternally()
+                return
+            }
+            guard let modified = state.1, modified > loadedAt else { return }
+            self.refreshExternally()
         }
+    }
+
+    /// FSEvents 回调只做路径归类，真正的读取统一走这里。
+    private func handleDirectoryEvent(_ event: DirectoryMonitor.Event) {
+        // 回调是异步投递到主线程的；用户可能已经切到别的目录。
+        // 上一个监视根的事件必须丢弃，否则 rootMoved/rootMissing 会把新目录带跑。
+        guard !event.root.isEmpty,
+              DirectoryMonitor.canonicalPath(currentDirectory) == event.root else { return }
+
+        if let moved = event.rootMovedTo {
+            rootRecoveryTask?.cancel()
+            rootRecoveryTask = nil
+            followDirectoryMove(to: URL(fileURLWithPath: moved, isDirectory: true))
+            return
+        }
+        if event.rootMissing {
+            scheduleRootMissingResolution()
+            return
+        }
+        if event.rootReplaced {
+            // 旧 stream/fd 还盯着被替换掉的 inode，重新安装监听后再读。
+            rootRecoveryTask?.cancel()
+            rootRecoveryTask = nil
+            monitor.stop()
+            monitorSinceEventID = DirectoryMonitor.currentEventID()
+            refreshExternally(changedPaths: event.paths)
+            return
+        }
+
+        guard hasLoadedOnce else { return }
+        let currentKey = DirectoryMonitor.canonicalPath(currentDirectory)
+        var reloadCurrent = event.mustScanSubDirs
+        var expandedToReload: Set<String> = []
+        var collapsedCacheToDrop: Set<String> = []
+
+        if event.mustScanSubDirs {
+            expandedToReload = expandedPaths
+            collapsedCacheToDrop.formUnion(
+                childItems.keys.filter { !expandedPaths.contains($0) }
+            )
+        } else {
+            for path in event.paths {
+                let key = DirectoryMonitor.canonicalPath(URL(fileURLWithPath: path))
+                // 当前目录本身或它的直接子项变化：刷新顶层列表。
+                if key == currentKey || Self.parentPath(key) == currentKey {
+                    reloadCurrent = true
+                }
+                // 事件落在已展开目录内部：只刷新那一层子项。
+                for expanded in expandedPaths {
+                    let expandedKey = DirectoryMonitor.canonicalPath(
+                        URL(fileURLWithPath: expanded, isDirectory: true)
+                    )
+                    if key == expandedKey || key.hasPrefix(expandedKey + "/") {
+                        expandedToReload.insert(expanded)
+                    }
+                }
+                // 收起过的展开目录仍留着旧子项缓存；期间的外部变化要清掉，
+                // 下次展开时重新读取，不能继续显示离开时的内容。
+                for cachedKey in childItems.keys where !expandedPaths.contains(cachedKey) {
+                    let cachedCanonical = DirectoryMonitor.canonicalPath(
+                        URL(fileURLWithPath: cachedKey, isDirectory: true)
+                    )
+                    if key == cachedCanonical || key.hasPrefix(cachedCanonical + "/") {
+                        collapsedCacheToDrop.insert(cachedKey)
+                    }
+                }
+            }
+            // 分栏视图的子列不在 expandedPaths 里；任何更深层变化都让顶层
+            // 重新提交一帧，FileColumnView 会据此失效并重读各列缓存。
+            if viewMode == .column, !event.paths.isEmpty {
+                reloadCurrent = true
+            }
+        }
+
+        for key in collapsedCacheToDrop {
+            childItems.removeValue(forKey: key)
+        }
+        guard reloadCurrent || !expandedToReload.isEmpty else { return }
+        refreshExternally(
+            changedPaths: event.paths,
+            reloadCurrent: reloadCurrent,
+            expandedDirectories: expandedToReload
+        )
+    }
+
+    /// 当前目录被改名（或它的上级被改名）：把历史里的当前项换成新路径，继续停在同一目录。
+    private func followDirectoryMove(to url: URL) {
+        let target = Self.normalizeDirectoryURL(url)
+        // FSEvents 说目标存在，但投递到主线程时可能又被改走/改回。
+        // 目标已经不在时先重读原路径；原路径也真的没了，读取错误会自然退父。
+        guard DirectoryMonitor.status(of: target) == .directory else {
+            monitor.stop()
+            monitorSinceEventID = DirectoryMonitor.currentEventID()
+            refreshExternally()
+            return
+        }
+        guard Self.pathKey(target) != Self.pathKey(currentDirectory) else {
+            monitor.stop()
+            monitorSinceEventID = DirectoryMonitor.currentEventID()
+            refreshExternally()
+            return
+        }
+        if historyIndex < history.count {
+            history[historyIndex] = target
+        }
+        beginNavigation(to: target)
+    }
+
+    /// 根目录刚被删除时先等一个合并窗口：原子替换/快速重建会在同路径重新出现。
+    /// 窗口结束仍是目录就留下重读；真的没了才退到最近存在的上级。
+    private func scheduleRootMissingResolution() {
+        // 同一次删除可能同时产生 rootMissing 和普通文件事件，只保留最早建立的复核窗口；
+        // 重复重置窗口会一直被后续事件顺延，反而退不了父。
+        guard rootRecoveryTask == nil else { return }
+        let directory = currentDirectory
+        rootRecoveryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard let self, !Task.isCancelled,
+                  Self.pathKey(self.currentDirectory) == Self.pathKey(directory) else { return }
+            self.rootRecoveryTask = nil
+
+            if DirectoryMonitor.status(of: directory) == .directory {
+                self.monitor.stop()
+                self.monitorSinceEventID = DirectoryMonitor.currentEventID()
+                self.refreshExternally()
+            } else {
+                self.navigateToNearestExistingParent()
+            }
+        }
+    }
+
+    /// 对齐访达：当前目录被删除时退到最近仍存在的上级目录。
+    private func navigateToNearestExistingParent() {
+        var parent = currentDirectory.deletingLastPathComponent()
+        var parentStatus = DirectoryMonitor.status(of: parent)
+        while Self.pathKey(parent) != "/",
+              parentStatus != .directory,
+              parentStatus != .denied {
+            parent = parent.deletingLastPathComponent()
+            parentStatus = DirectoryMonitor.status(of: parent)
+        }
+        guard Self.pathKey(parent) != Self.pathKey(currentDirectory),
+              parentStatus == .directory || parentStatus == .denied else {
+            monitor.stop()
+            monitorSinceEventID = nil
+            isLoading = false
+            errorMessage = "当前目录已不存在，也没有可返回的上级目录。"
+            return
+        }
+        if historyIndex < history.count {
+            history[historyIndex] = parent
+        }
+        beginNavigation(to: parent)
+    }
+
+    private func refreshExternally(
+        changedPaths: Set<String> = [],
+        reloadCurrent: Bool = true,
+        expandedDirectories: Set<String>? = nil
+    ) {
+        externalRefreshTask?.cancel()
+        let target = currentDirectory
+        let targetKey = Self.pathKey(target)
+        let directories = expandedDirectories ?? expandedPaths
+
+        externalRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            if !changedPaths.isEmpty {
+                await IconService.shared.invalidate(paths: changedPaths)
+            } else if reloadCurrent {
+                await IconService.shared.invalidate(
+                    paths: [DirectoryMonitor.canonicalPath(target)]
+                )
+            }
+
+            for key in directories {
+                guard !Task.isCancelled, self.expandedPaths.contains(key) else { continue }
+                let url = URL(fileURLWithPath: key, isDirectory: true)
+                await FileSystemHelper.invalidateCache(for: url)
+                do {
+                    let snapshot = try await FileSystemHelper.loadSnapshot(
+                        at: url,
+                        showHidden: self.showHidden,
+                        useCache: false,
+                        priority: self.activity.isActive ? .foreground : .background
+                    )
+                    guard !Task.isCancelled,
+                          Self.pathKey(self.currentDirectory) == targetKey else { return }
+                    // 用户在读取期间收起了这个目录，跳过它，但不要中止同批的其他刷新。
+                    guard self.expandedPaths.contains(key) else { continue }
+                    self.childItems[key] = snapshot.items
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    self.expandedPaths.remove(key)
+                    self.childItems.removeValue(forKey: key)
+                }
+            }
+
+            guard !Task.isCancelled,
+                  Self.pathKey(self.currentDirectory) == targetKey else { return }
+            if reloadCurrent {
+                await FileSystemHelper.invalidateCache(for: target)
+                guard !Task.isCancelled else { return }
+                self.loadCurrentDirectory(force: true)
+            } else {
+                self.scheduleContentRebuild(delayNanoseconds: 0)
+            }
+        }
+    }
+
+    /// 缓存命中后补一次后台强刷：返回旧目录、目录被删或权限变化时，
+    /// 首帧仍能立即显示，但不会一直停在过期快照上。
+    private func scheduleCacheRevalidation(for directory: URL) {
+        cacheValidationTask?.cancel()
+        cacheValidationTask = Task { [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled,
+                  Self.pathKey(self.currentDirectory) == Self.pathKey(directory) else { return }
+            self.loadCurrentDirectory(force: true)
+        }
+    }
+
+    private static func parentPath(_ path: String) -> String {
+        DirectoryMonitor.canonicalPath(
+            URL(fileURLWithPath: path).deletingLastPathComponent()
+        )
+    }
+
+    nonisolated static func isExistingDirectory(_ url: URL) -> Bool {
+        DirectoryMonitor.status(of: url) == .directory
+    }
+
+    /// TCC 目录权限和普通 POSIX 权限都会表现为读取失败；
+    /// 只有这类错误才展示权限引导，其他 I/O 错误保留系统文案。
+    private static func isPermissionError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain,
+           nsError.code == NSFileReadNoPermissionError {
+            return true
+        }
+        if nsError.domain == NSPOSIXErrorDomain,
+           (nsError.code == Int(EPERM) || nsError.code == Int(EACCES)) {
+            return true
+        }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return isPermissionError(underlying)
+        }
+        return false
+    }
+
+    private static func isMissingDirectoryError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain,
+           nsError.code == NSFileReadNoSuchFileError {
+            return true
+        }
+        if nsError.domain == NSPOSIXErrorDomain,
+           (nsError.code == Int(ENOENT) || nsError.code == Int(ENOTDIR)) {
+            return true
+        }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return isMissingDirectoryError(underlying)
+        }
+        return false
     }
 
     private func scheduleContentRebuild(

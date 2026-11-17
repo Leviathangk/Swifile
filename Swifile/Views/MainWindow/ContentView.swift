@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - 主窗口布局
@@ -92,6 +93,12 @@ struct ContentView: View {
             appState.loadAllPanes()
             // 自动化性能基准（SWIFILE_PERF_BENCH=1）
             PerfHarness.runIfNeeded(appState: appState)
+        }
+        // 兜底同步：应用回到前台时，检查目录是否在监听之外发生过变化
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification
+        )) { _ in
+            appState.panes.forEach { $0.refreshIfDirectoryChangedExternally() }
         }
         // 空格呼出的应用内悬浮预览（与分栏预览列共用 FilePreviewPanel 组件）
         .overlay {

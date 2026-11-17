@@ -19,25 +19,14 @@ enum SystemPermissionChecker {
         return (try? FileManager.default.contentsOfDirectory(atPath: safari.path(percentEncoded: false))) != nil
     }
 
-    /// 申请完全磁盘访问：读另一个 App 的容器目录（AllFiles 保护）触发系统确认弹窗。
-    /// 应用只有在发起过这类访问后才会出现在「完全磁盘访问」列表里（拒绝也会留记录）；
-    /// 纯 API 无法主动登记。随后打开系统设置直达授权页，保证两条路都走得通。
-    @MainActor
-    static func requestFullDiskAccess() {
-        let mailContainer = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Containers/com.apple.mail")
-        _ = try? FileManager.default.contentsOfDirectory(atPath: mailContainer.path(percentEncoded: false))
-
-        // 给系统弹窗留出展示时间，再打开授权页；没弹窗时也能直达列表
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            open("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
-        }
-    }
-
-    /// 在访达中显示应用本体：手动拖进系统设置授权列表用（最可靠的路）
+    /// 在访达中显示应用本体：手动拖进系统设置授权列表用。
     static func revealAppInFinder() {
         NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+    }
+
+    /// 系统设置 > 隐私与安全性 > 文件与文件夹
+    static func openFilesAndFoldersSettings() {
+        open("x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders")
     }
 
     /// 系统设置 > 隐私与安全性 > 完全磁盘访问

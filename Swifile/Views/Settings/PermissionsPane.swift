@@ -3,7 +3,7 @@ import SwiftUI
 // MARK: - 权限设置
 
 /// 权限面板：只管完全磁盘访问一项。
-/// 授权动作在系统设置里完成，这里负责触发申请、状态展示与自动核对。
+/// 授权动作只能由用户在系统设置里完成，这里负责状态展示与跳转。
 struct PermissionsPane: View {
     /// 完全磁盘访问的探测结果
     @State private var fullDiskAccess = false
@@ -30,8 +30,8 @@ struct PermissionsPane: View {
                         .foregroundStyle(.secondary)
                         .padding(.trailing, 4)
 
-                        Button("申请权限") {
-                            SystemPermissionChecker.requestFullDiskAccess()
+                        Button("打开系统设置") {
+                            SystemPermissionChecker.openFullDiskAccessSettings()
                         }
                     }
                 }

@@ -651,20 +651,32 @@ struct FileTableView: NSViewRepresentable, Equatable {
             priority: IconService.RequestPriority
         ) {
             let urlPath = file.url.path(percentEncoded: false)
-            // 路径未变且已拿到真实图标时不重来，避免滚动往返闪占位图
-            if cell.currentPath == urlPath, cell.hasLoadedIcon { return }
+            let generation = parent.fileGeneration
+            // 路径和版本未变且已拿到真实图标时不重来，避免滚动往返闪占位图；
+            // 文件内容变化时 FileItem 的修改时间或整表 generation 会变化，必须重新取图。
+            if cell.currentPath == urlPath,
+               cell.loadedGeneration == generation,
+               cell.hasLoadedIcon {
+                return
+            }
 
             let token = cell.nextToken()
             cell.iconTask?.cancel()
             cell.iconTask = nil
             cell.currentPath = urlPath
+            cell.loadedGeneration = generation
             cell.hasLoadedIcon = false
             cell.imageView?.image = IconService.placeholder(isDirectory: file.isDirectory, size: 16)
 
             guard activity?.isActive ?? false else { return }
 
             cell.iconTask = Task(priority: priority.taskPriority) { [weak cell] in
-                if let cached = IconService.shared.cached(path: urlPath, size: 16) {
+                if let cached = IconService.shared.cached(
+                    path: urlPath,
+                    size: 16,
+                    version: file.modificationDate,
+                    fileSize: file.size
+                ) {
                     await MainActor.run {
                         guard let cell, cell.currentPath == urlPath, cell.token == token else { return }
                         cell.imageView?.image = cached
@@ -676,6 +688,8 @@ struct FileTableView: NSViewRepresentable, Equatable {
                 let icon = await IconService.shared.icon(
                     for: urlPath,
                     size: 16,
+                    version: file.modificationDate,
+                    fileSize: file.size,
                     priority: priority
                 )
                 await MainActor.run {
@@ -763,6 +777,8 @@ final class FileNameCell: NSTableCellView {
 
     // 图标加载状态（随单元格复用一并重置）
     var currentPath: String = ""
+    /// 当前图标对应的目录 generation；外部刷新后即使路径不变也要重新取图
+    var loadedGeneration: UInt64 = 0
     /// 当前单元格是否已显示真实图标（false 表示仍在显示占位图）
     var hasLoadedIcon = false
     private(set) var token: UInt64 = 0
@@ -827,6 +843,7 @@ final class FileNameCell: NSTableCellView {
         iconTask?.cancel()
         iconTask = nil
         currentPath = ""
+        loadedGeneration = 0
         hasLoadedIcon = false
         super.prepareForReuse()
     }

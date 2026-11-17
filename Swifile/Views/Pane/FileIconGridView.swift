@@ -35,6 +35,7 @@ struct FileIconGridView: View, Equatable {
                 ForEach(files) { file in
                     IconCell(
                         file: file,
+                        fileGeneration: fileGeneration,
                         activity: activity,
                         selectionStore: selectionStore,
                         onActivate: onActivate,
@@ -74,6 +75,7 @@ struct FileIconGridView: View, Equatable {
 /// 图标使用 SwiftUI 原生 Image：单元格数量多，逐格建立 AppKit 桥接的代价很高。
 private struct IconCell: View {
     let file: FileItem
+    let fileGeneration: UInt64
     let activity: PaneActivity
     let selectionStore: SelectionStore
     let onActivate: () -> Void
@@ -92,8 +94,19 @@ private struct IconCell: View {
     @State private var lastClickTime: TimeInterval = 0
     @State private var lastClickPoint: CGPoint = .zero
 
+    private struct IconReloadKey: Hashable {
+        let url: URL
+        let version: Date?
+        let generation: UInt64
+    }
+
+    private var reloadKey: IconReloadKey {
+        IconReloadKey(url: file.url, version: file.modificationDate, generation: fileGeneration)
+    }
+
     init(
         file: FileItem,
+        fileGeneration: UInt64,
         activity: PaneActivity,
         selectionStore: SelectionStore,
         onActivate: @escaping () -> Void,
@@ -104,6 +117,7 @@ private struct IconCell: View {
         onRefresh: @escaping () -> Void
     ) {
         self.file = file
+        self.fileGeneration = fileGeneration
         self.activity = activity
         self.selectionStore = selectionStore
         self.onActivate = onActivate
@@ -116,7 +130,9 @@ private struct IconCell: View {
         _icon = State(
             initialValue: IconService.shared.cached(
                 path: file.url.path(percentEncoded: false),
-                size: Self.iconSize
+                size: Self.iconSize,
+                version: file.modificationDate,
+                fileSize: file.size
             )
         )
     }
@@ -187,7 +203,7 @@ private struct IconCell: View {
         // onDrag 在外」的结构，点击平均 4 ms。
         .contentShape(Rectangle())
         .onDrag { NSItemProvider(object: file.url as NSURL) }
-        .task(id: file.url) {
+        .task(id: reloadKey) {
             await loadIconIfNeeded()
         }
         .contextMenu {
@@ -216,17 +232,26 @@ private struct IconCell: View {
         }
     }
 
-    /// 单元格出现时取图标：命中缓存立即显示，未命中交给 IconService 排队。
-    /// 这里读取 activity 不构成 body 依赖，焦点切换不会让网格重新加载图标。
+    /// 单元格出现或目录刷新时取图标：缓存键带修改时间，外部覆盖文件后会重新生成。
     private func loadIconIfNeeded() async {
-        guard icon == nil else { return }
         let path = file.url.path(percentEncoded: false)
-        if let cached = IconService.shared.cached(path: path, size: Self.iconSize) {
+        if let cached = IconService.shared.cached(
+            path: path,
+            size: Self.iconSize,
+            version: file.modificationDate,
+            fileSize: file.size
+        ) {
             icon = cached
             return
         }
         let priority: IconService.RequestPriority = activity.isActive ? .foreground : .background
-        let loaded = await IconService.shared.icon(for: path, size: Self.iconSize, priority: priority)
+        let loaded = await IconService.shared.icon(
+            for: path,
+            size: Self.iconSize,
+            version: file.modificationDate,
+            fileSize: file.size,
+            priority: priority
+        )
         guard !Task.isCancelled else { return }
         icon = loaded
     }
