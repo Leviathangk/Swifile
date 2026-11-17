@@ -1,0 +1,73 @@
+name: Swifile
+options:
+  bundleIdPrefix: com.swifile
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+targets:
+  Swifile:
+    type: application
+    platform: macOS
+    sources:
+      - path: Swifile
+        excludes:
+          - "**/.DS_Store"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.swifile.app
+        PRODUCT_NAME: Swifile
+        INFOPLIST_FILE: Swifile/Info.plist
+        COMBINE_HIDPI_IMAGES: true
+        CODE_SIGN_ENTITLEMENTS: ""
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_APP_SANDBOX: false
+        ENABLE_CODE_COVERAGE: false
+        CLANG_COVERAGE_MAPPING: false
+        SWIFT_STRICT_CONCURRENCY: complete
+    info:
+      path: Swifile/Info.plist
+
+  SwifileTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: SwifileTests
+    dependencies:
+      - target: Swifile
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.swifile.tests
+        GENERATE_INFOPLIST_FILE: true
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_APP_SANDBOX: false
+        ENABLE_CODE_COVERAGE: false
+        CLANG_COVERAGE_MAPPING: false
+        SWIFT_STRICT_CONCURRENCY: complete
+
+schemes:
+  Swifile:
+    build:
+      targets:
+        Swifile: all
+        SwifileTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      gatherCoverageData: false
+      targets:
+        - SwifileTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

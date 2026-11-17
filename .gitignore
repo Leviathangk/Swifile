@@ -1,0 +1,24 @@
+# Xcode
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+build/
+*.xcworkspace/
+*.xcresult/
+*.profraw
+*.trace/
+*.dSYM/
+
+# macOS
+.DS_Store
+*.swp
+*.swo
+
+# Swift Package Manager
+.build/
+Packages/
+Package.resolved
+
+# 本地设计稿与内部工作文档（不上传）
+demo/
+docs/
