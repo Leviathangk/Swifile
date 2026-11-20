@@ -6,6 +6,8 @@ struct SwifileApp: App {
     @State private var appState = AppStateManager()
     /// 外观设置：启动时从 UserDefaults 读取并应用（影响所有窗口，含 AppKit 视图）
     @State private var appearance = AppearanceSettings()
+    /// 默认应用设置：启动时校验一次，失效的终端配置自动回退
+    private let defaultApps = DefaultAppsSettings.shared
     /// 设置窗口持有者：复用同一个窗口，重新打开时重新定位
     @State private var settingsPresenter = SettingsWindowPresenter()
 
@@ -16,6 +18,7 @@ struct SwifileApp: App {
                 onOpenSettings: {
                     settingsPresenter.show(
                         appearance: appearance,
+                        defaultApps: defaultApps,
                         favorites: appState.favorites
                     )
                 }
@@ -29,6 +32,7 @@ struct SwifileApp: App {
                 Button("设置…") {
                     settingsPresenter.show(
                         appearance: appearance,
+                        defaultApps: defaultApps,
                         favorites: appState.favorites
                     )
                 }

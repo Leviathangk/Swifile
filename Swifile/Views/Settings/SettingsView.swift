@@ -7,11 +7,13 @@ import SwiftUI
 /// 新分类只需扩 Pane 枚举并补一个详情页。
 struct SettingsView: View {
     @Bindable var appearance: AppearanceSettings
+    let defaultApps: DefaultAppsSettings
     let favorites: SidebarFavoritesSettings
 
     /// 设置分类；左栏行的图标与标题也在这里维护
     enum Pane: String, CaseIterable, Identifiable {
         case appearance
+        case defaultApps
         case favorites
         case permissions
         case about
@@ -21,6 +23,7 @@ struct SettingsView: View {
         var title: String {
             switch self {
             case .appearance: return "外观"
+            case .defaultApps: return "默认应用"
             case .favorites: return "收藏"
             case .permissions: return "权限"
             case .about: return "关于"
@@ -30,6 +33,7 @@ struct SettingsView: View {
         var icon: String {
             switch self {
             case .appearance: return "paintbrush"
+            case .defaultApps: return "app.badge"
             case .favorites: return "star"
             case .permissions: return "lock.shield"
             case .about: return "info.circle"
@@ -64,6 +68,8 @@ struct SettingsView: View {
                 switch selection {
                 case .appearance:
                     AppearancePane(appearance: appearance)
+                case .defaultApps:
+                    DefaultAppsPane(defaults: defaultApps)
                 case .favorites:
                     FavoritesPane(favorites: favorites)
                 case .permissions:

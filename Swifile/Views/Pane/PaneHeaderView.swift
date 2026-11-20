@@ -408,7 +408,7 @@ struct PaneHeaderView: View {
                 NSWorkspace.shared.open(pane.currentDirectory)
             }
             Button("在终端中打开") {
-                openInTerminal()
+                FileActions.openInTerminal(at: pane.currentDirectory)
             }
             Divider()
             Button("拷贝路径") {
@@ -432,17 +432,5 @@ struct PaneHeaderView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-    }
-
-    // MARK: - 操作
-
-    private func openInTerminal() {
-        let path = pane.currentDirectory.path(percentEncoded: false)
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let script = "tell application \"Terminal\" to do script \"cd \\\"\(path)\\\"\""
-        if let appleScript = NSAppleScript(source: script) {
-            var error: NSDictionary?
-            appleScript.executeAndReturnError(&error)
-        }
     }
 }

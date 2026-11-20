@@ -220,7 +220,7 @@ struct FileTableView: NSViewRepresentable, Equatable {
         }
 
         menu.addItem(item(.open, #selector(Coordinator.menuOpen(_:))))
-        menu.addItem(item(.openWith, #selector(Coordinator.menuOpenWith(_:))))
+        menu.addItem(coordinator.makeRowOpenWithItem())
         menu.addItem(item(.quickLook, #selector(Coordinator.menuQuickLook(_:))))
         menu.addItem(.separator())
         menu.addItem(item(.revealInFinder, #selector(Coordinator.menuRevealInFinder(_:))))
@@ -263,6 +263,8 @@ struct FileTableView: NSViewRepresentable, Equatable {
         private var pendingFiles: [FileItem]?
         /// 回写排序指示时的防重入标志
         var isSyncingSort = false
+        /// 「打开方式」子菜单控制器。NSMenu.delegate 是弱引用，必须在这里持有
+        private var openWithMenuControllers: [OpenWithMenuController] = []
 
         init(parent: FileTableView) {
             self.parent = parent
@@ -544,11 +546,42 @@ struct FileTableView: NSViewRepresentable, Equatable {
             menu.addItem(.separator())
             menu.addItem(item(.revealInFinder, #selector(menuRevealDirectory(_:))))
             menu.addItem(item(.openInTerminal, #selector(menuOpenDirectoryInTerminal(_:))))
+            menu.addItem(makeDirectoryOpenWithItem())
             menu.addItem(.separator())
             menu.addItem(item(.copyDirectoryPath, #selector(menuCopyDirectoryPath(_:))))
             menu.addItem(.separator())
             menu.addItem(item(.refresh, #selector(menuRefresh(_:))))
             return menu
+        }
+
+        // MARK: 打开方式子菜单
+
+        /// 行菜单的「打开方式」：目标取当前选中的文件（多选时作用于全部）
+        func makeRowOpenWithItem() -> NSMenuItem {
+            makeOpenWithItem { [weak self] in
+                self?.contextFiles.map(\.url) ?? []
+            }
+        }
+
+        /// 空白区域菜单的「打开方式」：目标就是当前目录
+        func makeDirectoryOpenWithItem() -> NSMenuItem {
+            makeOpenWithItem { [weak self] in
+                guard let directory = self?.parent.directory else { return [] }
+                return [directory]
+            }
+        }
+
+        private func makeOpenWithItem(urlsProvider: @escaping () -> [URL]) -> NSMenuItem {
+            let item = NSMenuItem(
+                title: FileMenuCommand.openWith.title,
+                action: nil,
+                keyEquivalent: ""
+            )
+            item.image = FileMenuCommand.openWith.menuImage
+            let controller = OpenWithMenuController(urlsProvider: urlsProvider)
+            openWithMenuControllers.append(controller)
+            item.submenu = controller.menu
+            return item
         }
 
         @objc func menuCreateFolder(_ sender: NSMenuItem) {
@@ -593,11 +626,6 @@ struct FileTableView: NSViewRepresentable, Equatable {
             FileActions.open(contextFiles) { file in
                 parent.onDoubleClick(file)
             }
-        }
-
-        @objc func menuOpenWith(_ sender: NSMenuItem) {
-            guard let file = contextFiles.first else { return }
-            FileActions.openWith(file)
         }
 
         @objc func menuRevealInFinder(_ sender: NSMenuItem) {

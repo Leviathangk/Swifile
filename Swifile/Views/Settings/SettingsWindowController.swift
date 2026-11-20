@@ -8,9 +8,17 @@ import SwiftUI
 final class SettingsWindowPresenter {
     private var controller: SettingsWindowController?
 
-    func show(appearance: AppearanceSettings, favorites: SidebarFavoritesSettings) {
+    func show(
+        appearance: AppearanceSettings,
+        defaultApps: DefaultAppsSettings,
+        favorites: SidebarFavoritesSettings
+    ) {
         let controller = self.controller
-            ?? SettingsWindowController(appearance: appearance, favorites: favorites)
+            ?? SettingsWindowController(
+                appearance: appearance,
+                defaultApps: defaultApps,
+                favorites: favorites
+            )
         self.controller = controller
         controller.show()
     }
@@ -20,9 +28,17 @@ final class SettingsWindowPresenter {
 /// 这样窗口第一帧就是最终位置，不会先出现在旧位置再瞬移。
 @MainActor
 final class SettingsWindowController: NSWindowController {
-    init(appearance: AppearanceSettings, favorites: SidebarFavoritesSettings) {
+    init(
+        appearance: AppearanceSettings,
+        defaultApps: DefaultAppsSettings,
+        favorites: SidebarFavoritesSettings
+    ) {
         let hosting = NSHostingController(
-            rootView: SettingsView(appearance: appearance, favorites: favorites)
+            rootView: SettingsView(
+                appearance: appearance,
+                defaultApps: defaultApps,
+                favorites: favorites
+            )
         )
         hosting.sizingOptions = []
         let window = NSWindow(contentViewController: hosting)

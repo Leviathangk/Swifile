@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - 文件操作动作
 
@@ -9,32 +10,49 @@ import SwiftUI
 /// 避免同一套动作在多处各写一份、行为逐渐分叉。
 @MainActor
 enum FileActions {
-    /// 打开：目录进入下一层，文件交给系统默认应用
+    /// 打开：目录进入下一层，文件交给「默认应用」设置或系统默认应用
     static func open(_ files: [FileItem], openDirectory: (FileItem) -> Void) {
         for file in files {
             if file.isDirectory {
                 openDirectory(file)
             } else {
-                NSWorkspace.shared.open(file.url)
+                openFile(at: file.url)
             }
         }
     }
 
-    /// 用其他应用打开
-    static func openWith(_ file: FileItem) {
+    /// 打开单个文件：优先使用「默认应用」里该类型的设置，否则交给系统默认应用
+    static func openFile(at url: URL) {
+        if let application = DefaultAppsSettings.shared.resolvedApplication(for: url) {
+            open([url], withApplicationAt: application.url)
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// 用指定应用打开一组文件或文件夹（「打开方式」列表里的每一项）
+    static func open(_ urls: [URL], withApplicationAt applicationURL: URL) {
+        guard !urls.isEmpty else { return }
+        NSWorkspace.shared.open(
+            urls,
+            withApplicationAt: applicationURL,
+            configuration: NSWorkspace.OpenConfiguration()
+        )
+    }
+
+    /// 用其他应用打开：弹出应用选择面板（「打开方式」里的「其他…」）
+    static func openWith(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.applicationBundle]
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
         panel.title = "选择应用"
         panel.prompt = "打开"
         if panel.runModal() == .OK, let appURL = panel.url {
-            NSWorkspace.shared.open(
-                [file.url],
-                withApplicationAt: appURL,
-                configuration: NSWorkspace.OpenConfiguration()
-            )
+            open(urls, withApplicationAt: appURL)
         }
     }
 
@@ -43,22 +61,19 @@ enum FileActions {
     }
 
     /// 在终端中打开：目录直接进入，文件则进入它所在的目录。
-    /// 走 `open -a Terminal`：不依赖 AppleScript，避免"自动化"权限被拒时整条动作静默失败。
+    /// 走设置里的默认终端，不依赖 AppleScript，避免"自动化"权限被拒时整条动作静默失败。
     static func openInTerminal(_ file: FileItem) {
         let dir = file.isDirectory ? file.url : file.url.deletingLastPathComponent()
         openInTerminal(at: dir)
     }
 
-    /// 在终端中打开指定目录（空白区域右键用）
+    /// 在终端中打开指定目录（空白区域右键用）。
+    /// 使用设置里的默认终端；应用被移除时由设置模型回退到系统终端。
     static func openInTerminal(at directory: URL) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-a", "Terminal", directory.path(percentEncoded: false)]
-        do {
-            try process.run()
-        } catch {
-            NSLog("Failed to open Terminal at \(directory.path(percentEncoded: false)): \(error)")
-        }
+        TerminalLauncher.open(
+            directory: directory,
+            using: DefaultAppsSettings.shared.resolvedTerminalApplication()
+        )
     }
 
     /// 在 Finder 中显示某个目录本身（空白区域右键用）
@@ -145,6 +160,7 @@ enum FileActions {
 enum FileMenuCommand: String {
     case open
     case openWith
+    case openWithOther
     case quickLook
     case revealInFinder
     case openInTerminal
@@ -160,7 +176,8 @@ enum FileMenuCommand: String {
     var title: String {
         switch self {
         case .open: return "打开"
-        case .openWith: return "用其他应用打开…"
+        case .openWith: return "打开方式"
+        case .openWithOther: return "其他…"
         case .quickLook: return "快速预览"
         case .revealInFinder: return "在 Finder 中显示"
         case .openInTerminal: return "在终端中打开"
@@ -174,10 +191,10 @@ enum FileMenuCommand: String {
         }
     }
 
-    /// SF Symbol 名；「打开」「用其他应用打开」在系统菜单里本来就没有图标
+    /// SF Symbol 名；「打开」「打开方式」在系统菜单里本来就没有图标
     var symbol: String? {
         switch self {
-        case .open, .openWith: return nil
+        case .open, .openWith, .openWithOther: return nil
         case .quickLook: return "eye"
         case .revealInFinder: return "magnifyingglass"
         case .openInTerminal: return "terminal"
@@ -220,9 +237,8 @@ struct FileContextMenu: View {
         FileMenuButton(command: .open) {
             FileActions.open(files, openDirectory: onOpenDirectory)
         }
-        FileMenuButton(command: .openWith) {
-            guard let first = files.first else { return }
-            FileActions.openWith(first)
+        if !files.isEmpty {
+            OpenWithMenu(urls: files.map(\.url))
         }
         FileMenuButton(command: .quickLook) {
             if let first = files.first {
@@ -287,6 +303,7 @@ struct DirectoryContextMenu: View {
         FileMenuButton(command: .openInTerminal) {
             FileActions.openInTerminal(at: directory)
         }
+        OpenWithMenu(urls: [directory])
 
         Divider()
 
@@ -325,6 +342,38 @@ struct FileMenuButton: View {
     var body: some View {
         Button(role: command.isDestructive ? .destructive : nil, action: action) {
             FileMenuLabel(command: command)
+        }
+    }
+}
+
+/// 「打开方式」子菜单：列视图、图标视图共用。
+/// 应用列表按第一个选中项的类型查询（多选时与访达一致），执行时作用于全部选中项。
+/// 查询发生在子菜单构建时，首次约 20ms，之后按类型走 30 秒缓存。
+struct OpenWithMenu: View {
+    let urls: [URL]
+
+    var body: some View {
+        Menu {
+            let applications = urls.first.map { ApplicationCatalog.applications(for: $0) } ?? []
+            ForEach(applications) { application in
+                Button {
+                    FileActions.open(urls, withApplicationAt: application.url)
+                } label: {
+                    Label {
+                        Text(application.name)
+                    } icon: {
+                        Image(nsImage: application.menuIcon)
+                    }
+                }
+            }
+            if !applications.isEmpty {
+                Divider()
+            }
+            Button(FileMenuCommand.openWithOther.title) {
+                FileActions.openWith(urls)
+            }
+        } label: {
+            FileMenuLabel(command: .openWith)
         }
     }
 }

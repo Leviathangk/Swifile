@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1.0</string>
+	<string>1.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>2</string>
+	<string>3</string>
 	<key>NSDesktopFolderUsageDescription</key>
 	<string>Swifile 需要访问桌面文件夹，以便浏览和整理其中的文件。</string>
 	<key>NSDocumentsFolderUsageDescription</key>
@@ -32,7 +32,5 @@
 	<string>Swifile 需要访问外置磁盘，以便浏览其中的文件。</string>
 	<key>NSNetworkVolumesUsageDescription</key>
 	<string>Swifile 需要访问网络磁盘，以便浏览其中的文件。</string>
-	<key>NSAppleEventsUsageDescription</key>
-	<string>Swifile 需要通过 AppleScript 调用终端，以便在终端中打开当前目录。</string>
 </dict>
 </plist>

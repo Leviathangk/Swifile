@@ -281,19 +281,19 @@ struct StagingAreaView: View {
         Button("移除", role: .destructive) { remove(items) }
     }
 
-    /// 打开：目录交给活动窗格导航，文件交给系统默认应用。
+    /// 打开：目录交给活动窗格导航，文件按「默认应用」设置打开。
     private func open(_ item: FileItem) {
         if item.isDirectory {
             paneFocus.activePane.navigate(to: item.url)
         } else {
-            NSWorkspace.shared.open(item.url)
+            FileActions.openFile(at: item.url)
         }
     }
 
-    /// 批量打开：文件全部交给系统，目录只导航到第一个，避免连续跳目录。
+    /// 批量打开：文件逐个按「默认应用」设置打开，目录只导航到第一个，避免连续跳目录。
     private func open(_ items: [FileItem]) {
         for item in items where !item.isDirectory {
-            NSWorkspace.shared.open(item.url)
+            FileActions.openFile(at: item.url)
         }
         if let directory = items.first(where: \.isDirectory) {
             paneFocus.activePane.navigate(to: directory.url)

@@ -55,7 +55,7 @@ struct FileColumnView: View {
                                 if file.isDirectory {
                                     pane.navigate(to: file.url)
                                 } else {
-                                    NSWorkspace.shared.open(file.url)
+                                    FileActions.openFile(at: file.url)
                                 }
                             },
                             onActivate: onActivate

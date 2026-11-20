@@ -32,8 +32,6 @@ targets:
         ENABLE_CODE_COVERAGE: false
         CLANG_COVERAGE_MAPPING: false
         SWIFT_STRICT_CONCURRENCY: complete
-    info:
-      path: Swifile/Info.plist
 
   SwifileTests:
     type: bundle.unit-test

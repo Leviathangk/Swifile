@@ -39,6 +39,7 @@
 - **快速访问**：把常用文件或文件夹拖进来即可添加引用
 - **收藏**：在设置里自选系统目录，侧栏保持清爽
 - **搜索与排序**：即时过滤；按名称、大小、日期、类型排序，目录优先
+- **打开方式**：右键悬停列出系统推荐应用；终端与图片、视频、音频、PDF、文本、压缩包可分别指定默认应用
 - **原生交互**：右键菜单、在 Finder 中打开、在终端中打开、窗口内设置
 - **主题**：跟随系统 / 浅色 / 深色
 
@@ -50,7 +51,7 @@ Swifile 对个人和非商业用途免费，源码公开，可自行构建。
 
 ## 下载与安装
 
-当前版本：`1.1.0`，DMG 约 2.8 MB。更新内容见 [CHANGELOG](CHANGELOG.md)。
+当前版本：`1.2.0`，DMG 约 2.8 MB。更新内容见 [CHANGELOG](CHANGELOG.md)。
 
 1. 从 [GitHub Releases](https://github.com/Leviathangk/Swifile/releases/latest) 下载 DMG
 2. 打开 DMG，把 Swifile 拖进 Applications
