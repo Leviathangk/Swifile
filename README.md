@@ -52,7 +52,7 @@ Swifile 对个人和非商业用途免费，源码公开，可自行构建。
 
 ## 下载与安装
 
-当前版本：`1.2.0`，DMG 约 2.8 MB。更新内容见 [CHANGELOG](CHANGELOG.md)。
+当前版本：`1.3.0`，DMG 约 2.8 MB。更新内容见 [CHANGELOG](CHANGELOG.md)。
 
 1. 从 [GitHub Releases](https://github.com/Leviathangk/Swifile/releases/latest) 下载 DMG
 2. 打开 DMG，把 Swifile 拖进 Applications
