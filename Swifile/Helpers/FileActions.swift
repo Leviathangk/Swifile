@@ -3,6 +3,40 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 
+// MARK: - 重命名错误
+
+/// 重命名失败的原因，文案直接展示在窗格内的告警框里。
+enum FileRenameError: LocalizedError {
+    case emptyName
+    case invalidName
+    case nameExists(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .emptyName:
+            return "名称不能为空。"
+        case .invalidName:
+            return "名称不能是「.」「..」，也不能包含「/」或「:」。"
+        case .nameExists(let name):
+            return "当前文件夹里已经有「\(name)」。"
+        }
+    }
+}
+
+/// 重命名时默认选中的范围：去掉扩展名只选中主名，与访达一致。
+/// 目录与隐藏文件（.gitignore 这类）选中全部。
+enum FileNameRange {
+    static func baseName(of name: String, isDirectory: Bool) -> NSRange {
+        let full = name as NSString
+        guard !isDirectory else { return NSRange(location: 0, length: full.length) }
+        let dot = full.range(of: ".", options: .backwards)
+        guard dot.location != NSNotFound, dot.location > 0 else {
+            return NSRange(location: 0, length: full.length)
+        }
+        return NSRange(location: 0, length: dot.location)
+    }
+}
+
 // MARK: - 文件操作动作
 
 /// 文件操作的共享实现。
@@ -88,8 +122,12 @@ enum FileActions {
         pasteboard.setString(url.path(percentEncoded: false), forType: .string)
     }
 
-    /// 在当前目录下新建文件夹，重名时自动加序号
-    static func createFolder(in directory: URL, onComplete: @escaping () -> Void) {
+    // MARK: - 新建文件夹
+
+    /// 在当前目录下新建文件夹，重名时自动加序号。
+    /// 创建完成后把新目录交给调用方：视图据此刷新、选中并直接进入行内重命名，
+    /// 与访达「新建文件夹后光标落在名字上」的体验一致。
+    static func createFolder(in directory: URL, onCreated: @escaping (URL) -> Void) {
         Task {
             let manager = FileManager.default
             var name = "未命名文件夹"
@@ -103,18 +141,66 @@ enum FileActions {
             do {
                 try manager.createDirectory(at: target, withIntermediateDirectories: false)
                 await FileSystemHelper.invalidateCache(for: directory)
+                await MainActor.run { onCreated(target) }
             } catch {
                 NSLog("Failed to create folder at \(target.path(percentEncoded: false)): \(error)")
             }
-            await MainActor.run { onComplete() }
         }
     }
 
-    static func copyURLs(_ files: [FileItem]) {
-        let urls = files.map(\.url) as [NSURL]
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.writeObjects(urls)
+    // MARK: - 重命名
+
+    /// 重命名一个文件或文件夹，返回改名后的 URL。
+    /// 与访达一致：不允许空名、路径分隔符；重名直接报错（不自动加序号）。
+    /// 只改大小写时走「临时名 → 目标名」两步，避免在大小写不敏感的卷上被判定为重名。
+    static func rename(_ url: URL, to rawName: String) throws -> URL {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw FileRenameError.emptyName }
+        guard name != ".", name != "..", !name.contains("/"), !name.contains(":") else {
+            throw FileRenameError.invalidName
+        }
+
+        let manager = FileManager.default
+        let source = url.standardizedFileURL
+        let directory = source.deletingLastPathComponent()
+        let isDirectory = (try? source.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+        let destination = directory
+            .appendingPathComponent(name, isDirectory: isDirectory)
+            .standardizedFileURL
+
+        let sourcePath = source.path(percentEncoded: false)
+        let destinationPath = destination.path(percentEncoded: false)
+        guard sourcePath != destinationPath else { return source }
+
+        if manager.fileExists(atPath: destinationPath) {
+            let caseOnly = sourcePath.compare(destinationPath, options: .caseInsensitive) == .orderedSame
+            guard caseOnly else { throw FileRenameError.nameExists(name) }
+
+            let temp = directory.appendingPathComponent(".swifile-rename-\(UUID().uuidString)")
+            try manager.moveItem(at: source, to: temp)
+            do {
+                try manager.moveItem(at: temp, to: destination)
+            } catch {
+                try? manager.moveItem(at: temp, to: source)
+                throw error
+            }
+        } else {
+            try manager.moveItem(at: source, to: destination)
+        }
+
+        return destination
+    }
+
+    // MARK: - 拷贝 / 剪切
+
+    /// 拷贝到剪贴板（⌘C）。写入标准 file URL，可以直接粘到访达。
+    static func copy(_ files: [FileItem]) {
+        FileClipboard.write(files.map(\.url), asCut: false)
+    }
+
+    /// 剪切到剪贴板（⌘X）：带自定义标记，粘贴时走移动语义。
+    static func cut(_ files: [FileItem]) {
+        FileClipboard.write(files.map(\.url), asCut: true)
     }
 
     static func copyPaths(_ files: [FileItem]) {
@@ -165,7 +251,11 @@ enum FileMenuCommand: String {
     case revealInFinder
     case openInTerminal
     case copy
+    case cut
+    case paste
     case copyPath
+    case duplicate
+    case rename
     case addToQuickAccess
     case addToStaging
     case moveToTrash
@@ -182,7 +272,11 @@ enum FileMenuCommand: String {
         case .revealInFinder: return "在 Finder 中显示"
         case .openInTerminal: return "在终端中打开"
         case .copy: return "拷贝"
+        case .cut: return "剪切"
+        case .paste: return "粘贴"
         case .copyPath, .copyDirectoryPath: return "拷贝路径"
+        case .duplicate: return "制作副本"
+        case .rename: return "重命名"
         case .addToQuickAccess: return "添加到快速访问"
         case .addToStaging: return "添加到暂存区"
         case .moveToTrash: return "移到废纸篓"
@@ -199,7 +293,11 @@ enum FileMenuCommand: String {
         case .revealInFinder: return "magnifyingglass"
         case .openInTerminal: return "terminal"
         case .copy: return "doc.on.doc"
-        case .copyPath, .copyDirectoryPath: return "doc.on.clipboard"
+        case .cut: return "scissors"
+        case .paste: return "doc.on.clipboard"
+        case .copyPath, .copyDirectoryPath: return "link"
+        case .duplicate: return "plus.square.on.square"
+        case .rename: return "pencil"
         case .addToQuickAccess: return "pin"
         case .addToStaging: return "tray.and.arrow.down"
         case .moveToTrash: return "trash"
@@ -223,19 +321,24 @@ enum FileMenuCommand: String {
 
 // MARK: - 文件右键菜单
 
-/// 文件右键菜单：列视图与图标视图共用，动作全部走 FileActions。
+/// 文件右键菜单：列视图与图标视图共用，动作全部走 FileActions / PaneOperations。
 /// 列表视图因为宿主是 NSTableView，仍用 AppKit 菜单，但同样按 FileMenuCommand 渲染。
 struct FileContextMenu: View {
+    let pane: PaneState
     let files: [FileItem]
     let staging: StagingState
     let preview: PreviewState
     let quickAccess: QuickAccessManager
-    let onOpenDirectory: (FileItem) -> Void
-    let onRefresh: () -> Void
+
+    /// 右击单个文件夹时，粘贴的目标就是这个文件夹；否则不显示这一项
+    private var pasteTarget: URL? {
+        guard files.count == 1, let first = files.first, first.isDirectory else { return nil }
+        return first.url
+    }
 
     var body: some View {
         FileMenuButton(command: .open) {
-            FileActions.open(files, openDirectory: onOpenDirectory)
+            FileActions.open(files) { pane.navigate(to: $0.url) }
         }
         if !files.isEmpty {
             OpenWithMenu(urls: files.map(\.url))
@@ -259,10 +362,30 @@ struct FileContextMenu: View {
         Divider()
 
         FileMenuButton(command: .copy) {
-            FileActions.copyURLs(files)
+            FileActions.copy(files)
+        }
+        FileMenuButton(command: .cut) {
+            FileActions.cut(files)
+        }
+        if let pasteTarget {
+            FileMenuButton(command: .paste) {
+                PaneOperations.paste(into: pane, directory: pasteTarget)
+            }
+            .disabled(!FileClipboard.hasFiles)
         }
         FileMenuButton(command: .copyPath) {
             FileActions.copyPaths(files)
+        }
+
+        Divider()
+
+        if files.count == 1, let first = files.first {
+            FileMenuButton(command: .rename) {
+                pane.requestRename(url: first.url, initialName: first.name)
+            }
+        }
+        FileMenuButton(command: .duplicate) {
+            PaneOperations.duplicate(files, in: pane)
         }
 
         Divider()
@@ -277,7 +400,7 @@ struct FileContextMenu: View {
         Divider()
 
         FileMenuButton(command: .moveToTrash) {
-            FileActions.moveToTrash(files) { onRefresh() }
+            FileActions.moveToTrash(files) { pane.refresh() }
         }
     }
 }
@@ -285,15 +408,19 @@ struct FileContextMenu: View {
 // MARK: - 目录右键菜单
 
 /// 空白区域右键菜单：作用于当前显示的目录本身。
-/// 列表视图用等价的 AppKit 菜单，动作同样走 FileActions。
+/// 列表视图用等价的 AppKit 菜单，动作同样走 FileActions / PaneOperations。
 struct DirectoryContextMenu: View {
+    let pane: PaneState
     let directory: URL
-    let onRefresh: () -> Void
 
     var body: some View {
         FileMenuButton(command: .newFolder) {
-            FileActions.createFolder(in: directory) { onRefresh() }
+            PaneOperations.createFolder(in: pane, directory: directory)
         }
+        FileMenuButton(command: .paste) {
+            PaneOperations.paste(into: pane, directory: directory)
+        }
+        .disabled(!FileClipboard.hasFiles)
 
         Divider()
 
@@ -314,7 +441,7 @@ struct DirectoryContextMenu: View {
         Divider()
 
         FileMenuButton(command: .refresh) {
-            onRefresh()
+            pane.refresh()
         }
     }
 }

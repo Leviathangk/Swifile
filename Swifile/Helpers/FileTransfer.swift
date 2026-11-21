@@ -36,10 +36,18 @@ struct FileTransferFailure: Sendable {
     let reason: String
 }
 
-/// 操作结果。succeeded/skipped 保存源 URL，便于调用方从暂存区精确移除。
+/// 操作结果。succeeded/skipped 保存源 URL，便于调用方从暂存区精确移除；
+/// placed 保存最终落地的路径（同目录粘贴时与源不同名），便于在窗格里选中新项。
 struct FileTransferResult: Sendable {
     let succeeded: [URL]
     let skipped: [URL]
+    let failures: [FileTransferFailure]
+    let placed: [URL]
+}
+
+/// 制作副本的结果：新条目路径 + 失败项。
+struct FileDuplicateResult: Sendable {
+    let created: [URL]
     let failures: [FileTransferFailure]
 }
 
@@ -97,6 +105,32 @@ enum FileTransfer {
         }.value
     }
 
+    /// 制作副本：每项复制到它自己所在的目录，命名与访达一致（「xxx 的副本」）。
+    static func duplicate(urls: [URL]) async -> FileDuplicateResult {
+        await Task.detached(priority: .userInitiated) {
+            let manager = FileManager.default
+            var created: [URL] = []
+            var failures: [FileTransferFailure] = []
+
+            for url in urls {
+                let source = url.standardizedFileURL
+                let directory = source.deletingLastPathComponent()
+                let destination = uniqueCopyDestination(for: source, in: directory)
+                do {
+                    try manager.copyItem(at: source, to: destination)
+                    created.append(destination)
+                } catch {
+                    failures.append(FileTransferFailure(
+                        name: source.lastPathComponent,
+                        reason: error.localizedDescription
+                    ))
+                }
+            }
+
+            return FileDuplicateResult(created: created, failures: failures)
+        }.value
+    }
+
     private static func run(
         urls: [URL],
         directory: URL,
@@ -108,20 +142,24 @@ enum FileTransfer {
         var succeeded: [URL] = []
         var skipped: [URL] = []
         var failures: [FileTransferFailure] = []
+        var placed: [URL] = []
 
         for source in urls {
             let sourceURL = source.standardizedFileURL
-            let destination = targetDirectory.appendingPathComponent(sourceURL.lastPathComponent)
+            var destination = targetDirectory.appendingPathComponent(sourceURL.lastPathComponent)
 
             if samePath(sourceURL, destination) {
-                failures.append(FileTransferFailure(
-                    name: sourceURL.lastPathComponent,
-                    reason: "已经在目标目录中"
-                ))
-                continue
-            }
-
-            if manager.fileExists(atPath: destination.path(percentEncoded: false)) {
+                // 同一目录里粘贴等同于「复制一份」：与访达一样自动换个名字，
+                // 而不是当作失败。移动没有这个语义，保持原样报错。
+                guard mode == .copy else {
+                    failures.append(FileTransferFailure(
+                        name: sourceURL.lastPathComponent,
+                        reason: "已经在目标目录中"
+                    ))
+                    continue
+                }
+                destination = uniqueCopyDestination(for: sourceURL, in: targetDirectory)
+            } else if manager.fileExists(atPath: destination.path(percentEncoded: false)) {
                 switch conflictPolicy {
                 case .skip:
                     skipped.append(sourceURL)
@@ -147,6 +185,7 @@ enum FileTransfer {
                     try manager.moveItem(at: sourceURL, to: destination)
                 }
                 succeeded.append(sourceURL)
+                placed.append(destination)
             } catch {
                 failures.append(FileTransferFailure(
                     name: sourceURL.lastPathComponent,
@@ -155,7 +194,36 @@ enum FileTransfer {
             }
         }
 
-        return FileTransferResult(succeeded: succeeded, skipped: skipped, failures: failures)
+        return FileTransferResult(
+            succeeded: succeeded,
+            skipped: skipped,
+            failures: failures,
+            placed: placed
+        )
+    }
+
+    /// 生成「xxx 的副本」「xxx 的副本 2」这类不冲突的目标路径。
+    /// 目录不拆扩展名，应用包（.app）按文件方式处理，与访达一致。
+    private static func uniqueCopyDestination(for source: URL, in directory: URL) -> URL {
+        let manager = FileManager.default
+        let values = try? source.resourceValues(forKeys: [.isDirectoryKey])
+        let isDirectory = values?.isDirectory ?? false
+        let splitExtension = !isDirectory || source.pathExtension.lowercased() == "app"
+
+        let rawName = source.lastPathComponent
+        let ext = splitExtension ? source.pathExtension : ""
+        let stem = ext.isEmpty ? rawName : (rawName as NSString).deletingPathExtension
+
+        var index = 0
+        while true {
+            let suffix = index == 0 ? " 的副本" : " 的副本 \(index + 1)"
+            let name = ext.isEmpty ? "\(stem)\(suffix)" : "\(stem)\(suffix).\(ext)"
+            let candidate = directory.appendingPathComponent(name, isDirectory: isDirectory)
+            if !manager.fileExists(atPath: candidate.path(percentEncoded: false)) {
+                return candidate
+            }
+            index += 1
+        }
     }
 
     private static func samePath(_ lhs: URL, _ rhs: URL) -> Bool {

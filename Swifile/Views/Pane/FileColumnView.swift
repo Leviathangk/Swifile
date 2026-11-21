@@ -38,8 +38,9 @@ struct FileColumnView: View {
                             quickAccess: quickAccess,
                             staging: staging,
                             preview: preview,
+                            pane: pane,
                             refreshToken: refreshToken,
-                            onRefresh: { pane.refresh() },
+                            renameRequest: pane.renameRequest,
                             onSelectDirectory: { url in
                                 // 锚点用目录本身而不是下标：body 被 equatable 跳过后
                                 // 闭包会跨帧复用，下标会失效
@@ -147,9 +148,12 @@ private struct ColumnPanel: View, Equatable {
     let quickAccess: QuickAccessManager
     let staging: StagingState
     let preview: PreviewState
+    /// 窗格状态：右键菜单里的粘贴、制作副本、重命名要回写告警框与选中
+    let pane: PaneState
     /// 变化即触发本列重读（窗格刷新后的联动信号）
     let refreshToken: UInt64
-    let onRefresh: () -> Void
+    /// 窗格级改名请求：落到本列的具体行
+    let renameRequest: PaneState.RenameRequest?
     let onSelectDirectory: (URL) -> Void
     let onSelectFile: (FileItem) -> Void
     let onDoubleClickFile: (FileItem) -> Void
@@ -174,7 +178,9 @@ private struct ColumnPanel: View, Equatable {
             lhs.sortField == rhs.sortField &&
             lhs.sortOrder == rhs.sortOrder &&
             lhs.query == rhs.query &&
-            lhs.refreshToken == rhs.refreshToken
+            lhs.refreshToken == rhs.refreshToken &&
+            // 改名请求要参与比较，否则请求变了这一列被整块跳过、表格永远进不了编辑态
+            lhs.renameRequest?.token == rhs.renameRequest?.token
     }
 
     var body: some View {
@@ -185,6 +191,9 @@ private struct ColumnPanel: View, Equatable {
                     file: file,
                     refreshToken: refreshToken,
                     activity: activity,
+                    isRenaming: renameRequest?.url == file.url,
+                    renameName: renameRequest?.initialName ?? file.name,
+                    pane: pane,
                     // 按下即选中：List 的选中由系统在 mouseUp 才提交，等它就慢半拍。
                     // 在行内手势按下那一刻直接选中并分发（目标状态幂等，mouseUp 时系统路径再来一次无害）。
                     onSelect: { select(file) },
@@ -196,12 +205,11 @@ private struct ColumnPanel: View, Equatable {
                 .onDrag { NSItemProvider(object: file.url as NSURL) }
                 .contextMenu {
                     FileContextMenu(
+                        pane: pane,
                         files: [file],
                         staging: staging,
                         preview: preview,
-                        quickAccess: quickAccess,
-                        onOpenDirectory: onDoubleClickFile,
-                        onRefresh: onRefresh
+                        quickAccess: quickAccess
                     )
                 }
             }
@@ -213,7 +221,7 @@ private struct ColumnPanel: View, Equatable {
         .onTapGesture { onActivate() }
         // 列的空白区域：给针对本列目录的操作（行上的菜单优先）
         .contextMenu {
-            DirectoryContextMenu(directory: directory) { onRefresh() }
+            DirectoryContextMenu(pane: pane, directory: directory)
         }
         .onChange(of: selectedURL) { _, newValue in
             handleSelectionChange(newValue)
@@ -297,6 +305,11 @@ private struct ColumnRow: View {
     let file: FileItem
     let refreshToken: UInt64
     let activity: PaneActivity
+    /// 本行是否处于行内改名
+    let isRenaming: Bool
+    /// 改名输入框的初始名字
+    let renameName: String
+    let pane: PaneState
     /// 按下即选中（展开下一列或记入窗格选中）
     let onSelect: () -> Void
     /// 双击：进入目录或打开文件
@@ -330,10 +343,34 @@ private struct ColumnRow: View {
             iconView
                 .frame(width: Self.iconSize, height: Self.iconSize)
 
-            Text(file.name)
-                .font(.system(size: 12))
-                .lineLimit(1)
-                .truncationMode(.middle)
+            if isRenaming {
+                InlineRenameField(
+                    initialName: renameName,
+                    isDirectory: file.isDirectory,
+                    fontSize: 12,
+                    height: 18,
+                    onCommit: { name in
+                        // 先消费请求再改名：失败时行还留在原路径，不消费会一直停在编辑态
+                        if let token = pane.renameRequest?.token,
+                           pane.renameRequest?.url == file.url {
+                            pane.consumeRenameRequest(token: token)
+                        }
+                        PaneOperations.rename(file.url, to: name, in: pane)
+                    },
+                    onCancel: {
+                        if let token = pane.renameRequest?.token,
+                           pane.renameRequest?.url == file.url {
+                            pane.consumeRenameRequest(token: token)
+                        }
+                    }
+                )
+                .frame(height: 18)
+            } else {
+                Text(file.name)
+                    .font(.system(size: 12))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
 
             Spacer()
 
@@ -345,18 +382,20 @@ private struct ColumnRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        // 按下即选中 + 松手时自判双击。
+        // 按下即选中 + 松手时自判双击。改名期间不再响应，输入框里要能点选、拖选文字。
         // 双击不再用 TapGesture(count: 2)：它与按下手势同时识别时，双击序列里的回调
         // 会被扣到系统判定结束（约 350 ms）才发出，双击与快速连点明显迟滞。
         // 自判的间隔用系统设置（NSEvent.doubleClickInterval）、落点要求接近，语义与系统一致。
         .simultaneousGesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { value in
+                    guard !isRenaming else { return }
                     // 零距离拖拽的第一次回调一定带 translation == .zero，拿它当按下瞬间的判据
                     guard value.translation == .zero else { return }
                     onSelect()
                 }
                 .onEnded { value in
+                    guard !isRenaming else { return }
                     // 移动超过微小抖动的算拖拽，不参与点击判定
                     guard abs(value.translation.width) < 4, abs(value.translation.height) < 4 else { return }
                     let now = ProcessInfo.processInfo.systemUptime

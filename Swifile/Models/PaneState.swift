@@ -42,6 +42,8 @@ final class PaneState: Identifiable {
 
     @ObservationIgnored let selectionStore = SelectionStore()
     @ObservationIgnored let activity = PaneActivity()
+    /// 窗格级告警框：拖放、粘贴、制作副本、重命名共用同一个展示位
+    @ObservationIgnored let dialogs = PaneDialogs()
 
     var viewMode: ViewMode = .list
     var sortField: SortField = .name {
@@ -124,6 +126,42 @@ final class PaneState: Identifiable {
 
     func requestPathEditing() {
         pathEditRequestToken &+= 1
+    }
+
+    // MARK: - 行内重命名
+
+    /// 一次行内改名请求。带 token 是为了支持对同一个文件再次进入改名。
+    struct RenameRequest: Equatable {
+        let token: UInt64
+        let url: URL
+        let initialName: String
+    }
+
+    /// 由视图消费的改名请求：列表、图标、分栏三种视图各自把它落到自己的行上。
+    private(set) var renameRequest: RenameRequest?
+
+    /// 下一次内容提交后要选中的目标。新建、粘贴、改名之后用；
+    /// 目标还没出现在列表里时先记着，出现的那一帧再选中。
+    @ObservationIgnored private var pendingSelectionURLs: Set<URL>?
+
+    func requestRename(url: URL, initialName: String) {
+        let token = (renameRequest?.token ?? 0) &+ 1
+        renameRequest = RenameRequest(
+            token: token,
+            url: url.standardizedFileURL,
+            initialName: initialName
+        )
+    }
+
+    func consumeRenameRequest(token: UInt64) {
+        guard renameRequest?.token == token else { return }
+        renameRequest = nil
+    }
+
+    func selectWhenAvailable(_ urls: [URL]) {
+        let normalized = Set(urls.map { $0.standardizedFileURL })
+        guard !normalized.isEmpty else { return }
+        pendingSelectionURLs = normalized
     }
 
     /// 导航到指定目录；缓存命中时立即使用快照，未命中时异步加载。
@@ -307,6 +345,9 @@ final class PaneState: Identifiable {
 
         currentDirectory = directory
         selectionStore.clear()
+        // 换目录后，上一个目录里发起的改名请求和待选中目标都不再适用
+        renameRequest = nil
+        pendingSelectionURLs = nil
         errorMessage = nil
         suppressQueryChange = true
         searchQuery = ""
@@ -850,8 +891,17 @@ final class PaneState: Identifiable {
         isLoading = false
 
         let validURLs = Set(content.files.map(\.url))
-        let retainedSelection = selectionStore.urls.intersection(validURLs)
-        selectionStore.set(retainedSelection)
+        var nextSelection = selectionStore.urls.intersection(validURLs)
+        // 新建、粘贴、改名后要把选中落到新条目上：目标出现的那一帧才提交，
+        // 提前提交会被这里的有效性过滤掉，表现为「建好了但没选中」。
+        if let pending = pendingSelectionURLs {
+            let matched = pending.intersection(validURLs)
+            if !matched.isEmpty {
+                nextSelection = matched
+                pendingSelectionURLs = nil
+            }
+        }
+        selectionStore.set(nextSelection)
     }
 
     static func normalizeDirectoryURL(_ url: URL) -> URL {

@@ -23,6 +23,10 @@ struct FileTableView: NSViewRepresentable, Equatable {
     let onRefresh: () -> Void
     /// 当前目录：空白区域右键的菜单作用于它
     let directory: URL
+    /// 窗格状态：新建、粘贴、重命名等动作需要回写告警框与选中
+    let pane: PaneState
+    /// 行内改名请求：由窗格发起，本视图负责落到具体那一行
+    let renameRequest: PaneState.RenameRequest?
     let sortField: SortField
     let sortOrder: SortOrder
     let onSortChange: (SortField) -> Void
@@ -37,7 +41,8 @@ struct FileTableView: NSViewRepresentable, Equatable {
     /// 文件内容由 fileGeneration 表示；选择和活动状态各自由 Coordinator 直接观察。
     nonisolated static func == (lhs: FileTableView, rhs: FileTableView) -> Bool {
         lhs.paneId == rhs.paneId &&
-            lhs.fileGeneration == rhs.fileGeneration
+            lhs.fileGeneration == rhs.fileGeneration &&
+            lhs.renameRequest?.token == rhs.renameRequest?.token
     }
 
     func makeCoordinator() -> Coordinator {
@@ -87,6 +92,8 @@ struct FileTableView: NSViewRepresentable, Equatable {
         nameCol.title = "名称"
         nameCol.width = 200
         nameCol.minWidth = 120
+        // 行内重命名由 FileNameCell 自己接管编辑态（见 beginRenaming），
+        // 名称列保持不可编辑：否则单击文字就会进编辑态，抢掉选中与双击。
         nameCol.isEditable = false
         nameCol.sortDescriptorPrototype = NSSortDescriptor(key: "name", ascending: true)
         // 名称列吃掉表格的剩余宽度（访达同款）。不用系统的 autoresizingMask：
@@ -150,6 +157,9 @@ struct FileTableView: NSViewRepresentable, Equatable {
         context.coordinator.applySelectionToTable(selectionStore.urls, tableView: tableView)
         context.coordinator.startObservingSelection()
         context.coordinator.startObservingActivity()
+        tableView.renameFieldLayoutHandler = { [weak coordinator] in
+            coordinator?.layoutRenamingField()
+        }
 
         scrollView.documentView = tableView
         return scrollView
@@ -160,6 +170,11 @@ struct FileTableView: NSViewRepresentable, Equatable {
         let coordinator = context.coordinator
 
         coordinator.parent = self
+        if coordinator.lastDirectory != directory {
+            coordinator.lastDirectory = directory
+            // 换了目录，之前没落地的改名请求作废，避免在别的目录里突然进入改名
+            coordinator.clearPendingRename()
+        }
         if coordinator.activity !== activity {
             coordinator.activity = activity
             coordinator.lastIsActive = activity.isActive
@@ -169,6 +184,14 @@ struct FileTableView: NSViewRepresentable, Equatable {
             coordinator.selectionStore = selectionStore
             coordinator.lastSelectionGeneration = selectionStore.generation
             coordinator.startObservingSelection()
+        }
+
+        // 0) 行内改名请求：先记为待办，等对应行出现在数据源里再落地
+        if coordinator.lastRenameToken != renameRequest?.token {
+            coordinator.lastRenameToken = renameRequest?.token
+            if let request = renameRequest {
+                coordinator.enqueueRename(request)
+            }
         }
 
         // 1) 文件数据：O(1) generation。切换布局后若窗格位置变化，也必须刷新数据源。
@@ -216,6 +239,8 @@ struct FileTableView: NSViewRepresentable, Equatable {
             let i = NSMenuItem(title: command.title, action: action, keyEquivalent: key)
             i.target = coordinator
             i.image = command.menuImage
+            // 记录命令身份：菜单展开时按它统一刷新可用性
+            i.representedObject = command.rawValue
             return i
         }
 
@@ -227,7 +252,12 @@ struct FileTableView: NSViewRepresentable, Equatable {
         menu.addItem(item(.openInTerminal, #selector(Coordinator.menuOpenInTerminal(_:))))
         menu.addItem(.separator())
         menu.addItem(item(.copy, #selector(Coordinator.menuCopy(_:)), key: "c"))
+        menu.addItem(item(.cut, #selector(Coordinator.menuCut(_:)), key: "x"))
+        menu.addItem(item(.paste, #selector(Coordinator.menuPaste(_:)), key: "v"))
         menu.addItem(item(.copyPath, #selector(Coordinator.menuCopyPath(_:))))
+        menu.addItem(.separator())
+        menu.addItem(item(.rename, #selector(Coordinator.menuRename(_:))))
+        menu.addItem(item(.duplicate, #selector(Coordinator.menuDuplicate(_:)), key: "d"))
         menu.addItem(.separator())
 
         // 快速访问是单一扁平列表，直接用一个菜单项添加
@@ -242,7 +272,7 @@ struct FileTableView: NSViewRepresentable, Equatable {
     // MARK: - Coordinator
 
     @MainActor
-    final class Coordinator: NSObject, NSTableViewDelegate, NSTableViewDataSource, NSMenuDelegate {
+    final class Coordinator: NSObject, NSTableViewDelegate, NSTableViewDataSource, NSMenuDelegate, NSTextFieldDelegate {
         var parent: FileTableView
         var currentFiles: [FileItem] = []
         var rowIndexByURL: [URL: Int] = [:]
@@ -265,6 +295,25 @@ struct FileTableView: NSViewRepresentable, Equatable {
         var isSyncingSort = false
         /// 「打开方式」子菜单控制器。NSMenu.delegate 是弱引用，必须在这里持有
         private var openWithMenuControllers: [OpenWithMenuController] = []
+        /// 已消费的改名请求 token，避免同一条请求反复触发
+        var lastRenameToken: UInt64?
+        /// 待落地的改名请求：目标行还没出现在数据源里时先记着
+        private var pendingRename: PaneState.RenameRequest?
+        /// 上一次的目录：换目录时作废未落地的改名
+        var lastDirectory: URL?
+
+        deinit {
+            if let monitor = renameClickMonitor {
+                NSEvent.removeMonitor(monitor)
+            }
+        }
+        /// 正在改名的输入框。作为表格子视图浮在行上方，不属于单元格，
+        /// 因此目录刷新重建单元格时不会被打断（新建后紧接着的那次刷新就是例子）。
+        private var renameField: NSTextField?
+        /// 改名框对应的文件，提交与跟随滚动时用
+        private var renamingURL: URL?
+        /// 改名期间的窗口级点击监听（点别处即提交）
+        private var renameClickMonitor: Any?
 
         init(parent: FileTableView) {
             self.parent = parent
@@ -285,6 +334,236 @@ struct FileTableView: NSViewRepresentable, Equatable {
                 map[file.url] = i
             }
             rowIndexByURL = map
+        }
+
+        // MARK: - 行内改名
+
+        /// 改名链路的诊断输出。SWIFILE_RENAME_DEBUG=1 时打开。
+        /// 编辑态这类「看得见但摸不着」的问题，只靠读代码推不出来，必须有实测日志。
+        private func renameLog(_ message: @autoclosure () -> String) {
+            guard ProcessInfo.processInfo.environment["SWIFILE_RENAME_DEBUG"] == "1" else { return }
+            NSLog("[rename] %@", message())
+        }
+
+        /// 记下改名请求，等目标行进入数据源后再进入编辑态。
+        /// 新建文件夹会先刷新目录，请求到达时行可能还没出现。
+        func enqueueRename(_ request: PaneState.RenameRequest) {
+            pendingRename = request
+            renameLog("enqueue token=\(request.token) url=\(request.url.lastPathComponent) rows=\(currentFiles.count)")
+            // 这里通常发生在 updateNSView 期间：等这一帧结束再落地，
+            // 否则会一边更新视图一边修改窗格状态
+            DispatchQueue.main.async { [weak self] in
+                self?.applyPendingRename()
+            }
+        }
+
+        func clearPendingRename() {
+            if pendingRename != nil { renameLog("clearPendingRename（换目录丢弃）") }
+            pendingRename = nil
+        }
+
+        private func applyPendingRename() {
+            guard let request = pendingRename else { return }
+            guard tableView != nil else {
+                renameLog("apply 跳过：tableView 为 nil")
+                return
+            }
+            guard let row = rowIndexByURL[request.url.standardizedFileURL] else {
+                renameLog("apply 暂缓：行还没出现（rows=\(currentFiles.count)）")
+                return
+            }
+            pendingRename = nil
+            renameLog("apply 命中 row=\(row)")
+            // 先消费请求：改名过程中目录会刷新，不能让同一条请求再触发一次
+            parent.pane.consumeRenameRequest(token: request.token)
+            beginRenaming(row: row)
+        }
+
+        /// 让某一行的名称进入行内编辑。
+        ///
+        /// 改名框是浮在表格上方的独立输入框，不属于单元格：
+        /// 访达同样是这个结构。把输入框做进单元格里会有两个后果——
+        /// 目录刷新一重建单元格编辑态就被销毁（新建文件夹后紧接着就刷新一次），
+        /// 而且受单元格裁剪影响，边框和焦点环都画不完整。
+        private func beginRenaming(row: Int) {
+            guard let tableView, row >= 0, row < currentFiles.count else {
+                renameLog("begin 跳过：row=\(row) 越界或表格为空")
+                return
+            }
+            endRenaming(commit: false)
+
+            let file = currentFiles[row]
+            tableView.scrollRowToVisible(row)
+            // 挂到 clipView 而不是 tableView：tableView.reloadData() 会重建自己的
+            // 全部子视图，直接把输入框挂上去会被那次刷新清掉（新建文件夹后紧接着
+            // 就会刷新一次，表现为「闪一下就没了」）。clipView 是表格的滚动容器，
+            // reloadData 不碰它；它的子视图还随滚动一起移动，正好是访达的行为。
+            guard let clipView = tableView.enclosingScrollView?.contentView else {
+                renameLog("begin 跳过：拿不到 clipView")
+                return
+            }
+            guard let frame = nameFieldFrame(row: row, in: clipView) else {
+                renameLog("begin 跳过：量不到名称文字位置 row=\(row)")
+                return
+            }
+            renameLog("begin row=\(row) name=\(file.name) frame=\(frame)")
+
+            let field = NSTextField(frame: frame)
+            field.stringValue = file.name
+            field.font = .systemFont(ofSize: 13)
+            field.isBordered = true
+            field.isBezeled = true
+            field.bezelStyle = .roundedBezel
+            field.drawsBackground = true
+            field.backgroundColor = .textBackgroundColor
+            field.textColor = .labelColor
+            // 明确的焦点环：深色模式下只靠 1px 描边根本看不出输入范围
+            field.focusRingType = .default
+            field.lineBreakMode = .byTruncatingTail
+            field.delegate = self
+            field.target = self
+            field.action = #selector(renameFieldAction(_:))
+            clipView.addSubview(field)
+
+            renameField = field
+            renamingURL = file.url
+            installRenameClickMonitor()
+
+            tableView.window?.makeFirstResponder(field)
+            if let editor = field.currentEditor() as? NSTextView {
+                editor.selectedRange = FileNameRange.baseName(
+                    of: file.name,
+                    isDirectory: file.isDirectory
+                )
+            }
+        }
+
+        /// 名称文字在改名框宿主视图坐标系里的位置。
+        ///
+        /// 必须先把布局跑完再量：单元格可能是刚创建的（新建文件夹的下一帧就是），
+        /// 此时 Auto Layout 还没执行，label 的 bounds 是 4×0（实测值），
+        /// 照着量会得到一个贴在三角上的小方块。强制布局后才是真实的 162×16。
+        private func nameFieldFrame(row: Int, in host: NSView) -> NSRect? {
+            guard let tableView else { return nil }
+            tableView.layoutSubtreeIfNeeded()
+            guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: true),
+                  let label = (cell as? FileNameCell)?.textField else { return nil }
+
+            // 先在表格坐标系里算好，再整体换算到宿主，避免两套坐标混用
+            let labelRect = label.convert(label.bounds, to: tableView)
+            let font = label.font ?? .systemFont(ofSize: 13)
+            let textWidth = ceil((label.stringValue as NSString)
+                .size(withAttributes: [.font: font]).width)
+            // 右边界取名称列右侧：长名字铺到列尾，不压到「修改日期」列
+            let columnRight = tableView.rect(ofColumn: 0).maxX
+            let maxWidth = max(72, columnRight - labelRect.minX - 6)
+            // 只比文字宽一点点：框贴着名字，读起来是「这个名字在编辑」
+            let width = min(max(96, textWidth + 16), maxWidth)
+
+            // 输入框只比文字高一点：占满整行会像是「另盖了一层东西」而不是名字本身在编辑。
+            // 垂直居中于文字，焦点环仍画得下。
+            let height: CGFloat = 20
+            // 左侧让出圆角边框的文字内缩（实测 NSTextFieldCell 的 drawingRect
+            // 把文字往里推 4pt）：输入框左边缘取 -4，框内文字才正好落在原位置，
+            // 进入编辑时那一瞬间文字不会横向跳一下。
+            let rect = NSRect(
+                x: labelRect.minX - 4,
+                y: labelRect.midY - height / 2,
+                width: width,
+                height: height
+            )
+            return host.convert(rect, from: tableView)
+        }
+
+        /// 跟随滚动与窗口尺寸变化，让改名框始终贴着那一行。
+        /// 行被滚出可视区域时不结束编辑：框随内容一起滚走又滚回，
+        /// 只有那一行真的没了（文件被删）才收尾。
+        func layoutRenamingField() {
+            guard let field = renameField, let host = field.superview,
+                  let url = renamingURL else { return }
+            guard let row = rowIndexByURL[url] else {
+                endRenaming(commit: true, reason: "目标行已不在列表")
+                return
+            }
+            guard let frame = nameFieldFrame(row: row, in: host) else { return }
+            field.frame = frame
+        }
+
+        // MARK: 点别处结束
+
+        /// 改名期间装一个窗口级点击监听：点列表、工具栏、侧栏、其它窗格都算
+        /// 「确认并退出」。只靠字段失焦不够——工具栏按钮这类控件不抢第一响应者，
+        /// 点上去编辑态会一直留着（访达是点哪都退出）。
+        private func installRenameClickMonitor() {
+            guard renameClickMonitor == nil else { return }
+            renameClickMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown]
+            ) { [weak self] event in
+                MainActor.assumeIsolated {
+                    self?.handleClickOutsideRenameField(event)
+                }
+                return event
+            }
+        }
+
+        private func removeRenameClickMonitor() {
+            guard let monitor = renameClickMonitor else { return }
+            NSEvent.removeMonitor(monitor)
+            renameClickMonitor = nil
+        }
+
+        private func handleClickOutsideRenameField(_ event: NSEvent) {
+            guard let field = renameField, let window = field.window else { return }
+            // 其它窗口的点击不归这里管
+            guard event.window === window else { return }
+            let point = field.convert(event.locationInWindow, from: nil)
+            guard !field.bounds.contains(point) else { return }
+            endRenaming(commit: true, reason: "点别处")
+        }
+
+        /// 结束改名。commit 为 true 时按当前文字提交，否则丢弃。
+        private func endRenaming(commit: Bool, reason: String = "") {
+            guard let field = renameField else { return }
+            let name = field.stringValue
+            let url = renamingURL
+            renameLog("end commit=\(commit) reason=\(reason.isEmpty ? "-" : reason) name=\(name)")
+            // 点别处的收尾不能抢走那次点击的焦点：先看这一击是不是落在本窗格表格上，
+            // 是的话把焦点还给表格，否则交给原本要接收点击的控件。
+            let parentWindow = field.window
+            let wasInTable = parentWindow?.firstResponder is NSTextView
+            // 先清状态再动焦点：清空 delegate 与状态后，
+            // makeFirstResponder 触发的 controlTextDidEndEditing 会被 guard 挡住，不会二次进入
+            renameField = nil
+            renamingURL = nil
+            removeRenameClickMonitor()
+
+            field.delegate = nil
+            field.target = nil
+            field.action = nil
+            if wasInTable, let tableView = self.tableView, let parentWindow {
+                parentWindow.makeFirstResponder(tableView)
+            }
+            field.removeFromSuperview()
+
+            guard commit, let url else { return }
+            // 名字没变就什么都不做，免得多刷一次目录
+            let original = currentFiles.first(where: { $0.url == url })?.name
+                ?? url.lastPathComponent
+            guard name != original else { return }
+            PaneOperations.rename(url, to: name, in: parent.pane)
+        }
+
+        /// 回车：立即提交并把焦点还给表格
+        @objc private func renameFieldAction(_ sender: NSTextField) {
+            endRenaming(commit: true, reason: "回车")
+        }
+
+        func controlTextDidEndEditing(_ notification: Notification) {
+            guard renameField != nil else { return }
+            // Esc 取消；回车、点别处、切窗口都按提交处理，与访达一致
+            let movement = (notification.userInfo?["NSTextMovement"] as? Int)
+                .flatMap(NSTextMovement.init(rawValue:))
+            endRenaming(commit: movement != .cancel, reason: "失去焦点")
         }
 
         func startObservingSelection() {
@@ -406,6 +685,11 @@ struct FileTableView: NSViewRepresentable, Equatable {
             table.endUpdates()
             table.reloadData()
             applySelectionToTable(selectionStore.urls, tableView: table)
+            // 改名框是浮层：重载后单元格是新的，必须按新的一行重新贴上去，
+            // 否则新建文件夹后的那次刷新会把框留在旧位置
+            layoutRenamingField()
+            // 新建、粘贴之后目标行出现在这一帧，改名请求此时才落得到具体的行
+            applyPendingRename()
 
             let maxY = max(0, table.bounds.height - scrollView.contentView.bounds.height)
             scrollView.contentView.scroll(to: NSPoint(x: oldOrigin.x, y: min(oldOrigin.y, maxY)))
@@ -435,6 +719,10 @@ struct FileTableView: NSViewRepresentable, Equatable {
 
         /// 表格的键盘焦点进出：写入 activity，可见行的选中色随之在强调/弱化间切换
         func handleFocusChange(_ focused: Bool) {
+            // 改名时输入框接管了第一响应者，表格本身会报告「失去焦点」。
+            // 但用户视角里窗格并没有失焦：此时把选中降成灰色，看起来就像
+            // 「先选中整行、再跳到别处」的两段式。改名期间保持强调色。
+            if !focused, renameField != nil { return }
             activity?.setKeyboardFocus(focused)
         }
 
@@ -533,16 +821,20 @@ struct FileTableView: NSViewRepresentable, Equatable {
 
         /// 空白区域菜单：作用于当前目录本身
         func makeDirectoryMenu() -> NSMenu {
+            // 空白区域菜单也要在展开时刷新可用性（粘贴依赖剪贴板）
             let menu = NSMenu()
+            menu.delegate = self
 
             func item(_ command: FileMenuCommand, _ action: Selector, key: String = "") -> NSMenuItem {
                 let i = NSMenuItem(title: command.title, action: action, keyEquivalent: key)
                 i.target = self
                 i.image = command.menuImage
+                i.representedObject = command.rawValue
                 return i
             }
 
             menu.addItem(item(.newFolder, #selector(menuCreateFolder(_:))))
+            menu.addItem(item(.paste, #selector(menuPasteIntoDirectory(_:))))
             menu.addItem(.separator())
             menu.addItem(item(.revealInFinder, #selector(menuRevealDirectory(_:))))
             menu.addItem(item(.openInTerminal, #selector(menuOpenDirectoryInTerminal(_:))))
@@ -585,9 +877,11 @@ struct FileTableView: NSViewRepresentable, Equatable {
         }
 
         @objc func menuCreateFolder(_ sender: NSMenuItem) {
-            FileActions.createFolder(in: parent.directory) { [weak self] in
-                self?.parent.onRefresh()
-            }
+            PaneOperations.createFolder(in: parent.pane, directory: parent.directory)
+        }
+
+        @objc func menuPasteIntoDirectory(_ sender: NSMenuItem) {
+            PaneOperations.paste(into: parent.pane, directory: parent.directory)
         }
 
         @objc func menuRevealDirectory(_ sender: NSMenuItem) {
@@ -611,6 +905,37 @@ struct FileTableView: NSViewRepresentable, Equatable {
             let clickedRow = tableView.clickedRow
             if clickedRow >= 0 && !tableView.selectedRowIndexes.contains(clickedRow) {
                 tableView.selectRowIndexes(IndexSet(integer: clickedRow), byExtendingSelection: false)
+            }
+            // 行菜单与空白区域菜单共用这个 delegate，各按自己的上下文刷新可用性
+            if menu === tableView.menu {
+                updateRowMenuItems(menu)
+            } else {
+                updateDirectoryMenuItems(menu)
+            }
+        }
+
+        /// 行菜单的可用性：粘贴依赖剪贴板，重命名只对单项开放。
+        private func updateRowMenuItems(_ menu: NSMenu) {
+            let canPaste = FileClipboard.hasFiles
+            let single = contextFiles.count == 1
+            for item in menu.items {
+                switch FileMenuCommand(rawValue: item.representedObject as? String ?? "") {
+                case .paste:
+                    item.isEnabled = canPaste
+                case .rename:
+                    item.isEnabled = single
+                default:
+                    break
+                }
+            }
+        }
+
+        /// 空白区域菜单的可用性：只取决于剪贴板里有没有文件。
+        private func updateDirectoryMenuItems(_ menu: NSMenu) {
+            let canPaste = FileClipboard.hasFiles
+            for item in menu.items
+            where FileMenuCommand(rawValue: item.representedObject as? String ?? "") == .paste {
+                item.isEnabled = canPaste
             }
         }
 
@@ -644,7 +969,31 @@ struct FileTableView: NSViewRepresentable, Equatable {
         }
 
         @objc func menuCopy(_ sender: NSMenuItem) {
-            FileActions.copyURLs(contextFiles)
+            FileActions.copy(contextFiles)
+        }
+
+        @objc func menuCut(_ sender: NSMenuItem) {
+            FileActions.cut(contextFiles)
+        }
+
+        /// 行菜单的粘贴：右击的是单个文件夹就粘进去，否则粘到当前目录
+        @objc func menuPaste(_ sender: NSMenuItem) {
+            let target: URL
+            if contextFiles.count == 1, let folder = contextFiles.first, folder.isDirectory {
+                target = folder.url
+            } else {
+                target = parent.directory
+            }
+            PaneOperations.paste(into: parent.pane, directory: target)
+        }
+
+        @objc func menuRename(_ sender: NSMenuItem) {
+            guard contextFiles.count == 1, let file = contextFiles.first else { return }
+            parent.pane.requestRename(url: file.url, initialName: file.name)
+        }
+
+        @objc func menuDuplicate(_ sender: NSMenuItem) {
+            PaneOperations.duplicate(contextFiles, in: parent.pane)
         }
 
         @objc func menuCopyPath(_ sender: NSMenuItem) {
@@ -927,6 +1276,12 @@ final class PaneRowView: NSTableRowView {
     /// 查询当前是否应当用强调色画选中
     var emphasizedProvider: (() -> Bool)?
 
+    /// 选中块的内缩与圆角：访达的选中不是通栏直角块，而是左右留白、四角微圆。
+    /// 系统默认 drawSelection 画的是铺满整行的矩形，这里自己画。
+    private static let selectionInsetX: CGFloat = 4
+    private static let selectionInsetY: CGFloat = 1
+    private static let selectionCornerRadius: CGFloat = 5
+
     override var isEmphasized: Bool {
         get {
             // 窗口失去焦点时，系统把选中整体降为弱化色
@@ -934,6 +1289,28 @@ final class PaneRowView: NSTableRowView {
             return emphasizedProvider?() ?? true
         }
         set { super.isEmphasized = newValue }
+    }
+
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard selectionHighlightStyle != .none else { return }
+        // 行的 bounds 比可视区宽：style = .inset 的表格会在内容右侧留出内边距，
+        // 行的 frame 宽度 = 列宽合计 + 内边距。直接按 bounds 画，右边那点内缩
+        // 就落进内边距里、被可视区裁掉，看起来只有左边有留白。
+        // 以「这一行真正可见的范围」为准，左右留白才会对称。
+        let drawBounds = visibleRect.isEmpty ? bounds : visibleRect
+        let rect = drawBounds.insetBy(dx: Self.selectionInsetX, dy: Self.selectionInsetY)
+        guard rect.width > 0, rect.height > 0 else { return }
+
+        // isEmphasized 已综合窗格焦点与窗口焦点，直接取系统选中色
+        let fill = isEmphasized
+            ? NSColor.selectedContentBackgroundColor
+            : NSColor.unemphasizedSelectedContentBackgroundColor
+        fill.setFill()
+        NSBezierPath(
+            roundedRect: rect,
+            xRadius: Self.selectionCornerRadius,
+            yRadius: Self.selectionCornerRadius
+        ).fill()
     }
 }
 
@@ -1014,6 +1391,9 @@ final class SwifileTableView: NSTableView {
         }
     }
 
+    /// 改名框跟随布局：行位置随列宽与滚动变化，由外部在 layout/滚动时回调
+    var renameFieldLayoutHandler: (() -> Void)?
+
     /// 键盘焦点进入/离开表格：选中色要跟着焦点变强调或弱化
     override func becomeFirstResponder() -> Bool {
         let accepted = super.becomeFirstResponder()
@@ -1030,6 +1410,8 @@ final class SwifileTableView: NSTableView {
     override func layout() {
         super.layout()
         syncColumnsForVisibleWidth()
+        // 改名框是表格子视图，行位置随列宽/滚动变化，每帧重新贴一次
+        renameFieldLayoutHandler?()
     }
 
     /// 侧栏展开动画期间，右侧内容区只逐帧右移、宽度到动画结束才提交，
@@ -1049,6 +1431,8 @@ final class SwifileTableView: NSTableView {
         let center = NotificationCenter.default
         let handler: (Notification) -> Void = { [weak self] _ in
             self?.syncColumnsForVisibleWidth()
+            // 滚动或窗口尺寸变化时，改名框要跟着那一行走
+            self?.renameFieldLayoutHandler?()
         }
         for (name, object) in [
             (NSView.frameDidChangeNotification, scrollView),

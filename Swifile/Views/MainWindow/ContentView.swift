@@ -111,6 +111,8 @@ struct ContentView: View {
         }
         .animation(.easeOut(duration: 0.15), value: appState.preview.item?.url)
         .background(PreviewHotkeys(paneFocus: appState.paneFocus, preview: appState.preview))
+        // 文件区快捷键：⌘C / ⌘X / ⌘V / ⌘D / ⌘⌫ / ⌘A / ⌘O / Return
+        .background(FileEditHotkeys(paneFocus: appState.paneFocus, preview: appState.preview))
     }
 }
 

@@ -40,6 +40,7 @@
 - **收藏**：在设置里自选系统目录，侧栏保持清爽
 - **搜索与排序**：即时过滤；按名称、大小、日期、类型排序，目录优先
 - **打开方式**：右键悬停列出系统推荐应用；终端与图片、视频、音频、PDF、文本、压缩包可分别指定默认应用
+- **编辑动作**：新建后直接改名、`Return` 重命名、`⌘C` / `⌘X` / `⌘V` 拷贝剪切粘贴、`⌘D` 制作副本
 - **原生交互**：右键菜单、在 Finder 中打开、在终端中打开、窗口内设置
 - **主题**：跟随系统 / 浅色 / 深色
 
@@ -81,6 +82,19 @@ xcrun swiftc -O -j 2 \
 ```
 
 当前直接构建目标是 Apple Silicon（arm64）。
+
+## 本地开发
+
+如果本机 Xcode 因为插件问题无法正常 Run，可以用 `scripts` 里的脚本：
+
+```bash
+./scripts/dev.sh              # 构建当前工作区并启动开发包
+./scripts/dev.sh --build-only # 只构建，不启动
+./scripts/dev.sh --debug      # 使用 -Onone -g，方便断点
+./scripts/test.sh             # 手工构建并运行 XCTest
+```
+
+开发包输出到 `build/dev/Swifile.app`，日志在 `build/dev/Swifile.log`。没有热重载，改完代码重新执行 `dev.sh`。
 
 <details>
 <summary>技术细节</summary>

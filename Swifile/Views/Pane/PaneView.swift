@@ -1,27 +1,5 @@
 import SwiftUI
 
-// MARK: - 告警框状态
-
-/// 拖入窗格时等待用户决定覆盖/跳过的请求。
-private struct PendingDropConflict {
-    let files: [URL]
-    let target: URL
-    let presentation: FileConflictPresentation
-}
-
-/// 窗格同一时间只展示一个窗口内告警框：冲突询问或结果提示。
-private enum PaneDialog {
-    case conflict(PendingDropConflict)
-    case result(title: String, message: String)
-
-    var message: String {
-        switch self {
-        case .conflict(let pending): return pending.presentation.message
-        case .result(_, let message): return message
-        }
-    }
-}
-
 // MARK: - 单个窗格视图
 /// 内容区不订阅窗格的活动状态，避免焦点切换时触发表格重建。
 struct PaneView: View {
@@ -33,7 +11,6 @@ struct PaneView: View {
 
     /// 文件拖到窗格上时的高亮与提示
     @State private var isDropTarget = false
-    @State private var activeDialog: PaneDialog?
 
     var body: some View {
         PaneBodyView(
@@ -50,8 +27,12 @@ struct PaneView: View {
         // 相邻窗格、甚至半透明侧栏底下透出来。
         .clipped()
         // 从暂存区或访达拖进来的文件默认复制到当前目录；需要移动时用暂存区的移动按钮。
+        // 冲突询问、结果提示统一走窗格级告警框，和右键粘贴共用同一个展示位。
         .dropDestination(for: URL.self) { urls, _ in
-            handleDrop(urls)
+            let files = urls.filter(\.isFileURL)
+            guard !files.isEmpty else { return false }
+            PaneOperations.copyDropped(files, into: pane)
+            return true
         } isTargeted: { isDropTarget = $0 }
         .overlay {
             if isDropTarget {
@@ -61,114 +42,45 @@ struct PaneView: View {
                     .allowsHitTesting(false)
             }
         }
-        .alert(Text(dialogTitle), isPresented: dialogBinding, presenting: activeDialog) { dialog in
-            switch dialog {
-            case .conflict(let pending):
-                Button(pending.presentation.skipButtonTitle) {
-                    resolveConflict(pending, policy: .skip)
-                }
-                Button(pending.presentation.overwriteButtonTitle, role: .destructive) {
-                    resolveConflict(pending, policy: .overwrite)
-                }
-                Button("取消", role: .cancel) {}
-            case .result:
-                Button("好", role: .cancel) {}
-            }
-        } message: { dialog in
-            Text(dialog.message)
+        .alert(dialogTitle, isPresented: dialogBinding) {
+            dialogButtons
+        } message: {
+            Text(pane.dialogs.content?.message ?? "")
         }
         .onAppear { pane.ensureLoaded() }
     }
 
     private var dialogTitle: String {
-        switch activeDialog {
-        case .conflict(let pending): return pending.presentation.title
-        case .result(let title, _): return title
-        case nil: return ""
-        }
+        pane.dialogs.content?.title ?? ""
     }
 
     private var dialogBinding: Binding<Bool> {
         Binding(
-            get: { activeDialog != nil },
-            set: { if !$0 { activeDialog = nil } }
+            get: { pane.dialogs.content != nil },
+            set: { if !$0 { pane.dialogs.dismiss() } }
         )
     }
 
-    /// 接收 Finder/暂存区等外部拖入：复制到当前窗格目录。
-    private func handleDrop(_ urls: [URL]) -> Bool {
-        let target = pane.currentDirectory
-        // 过滤掉本来就在当前目录里的项，避免把窗格内拖动误判成一次复制失败。
-        let files = urls.filter {
-            $0.isFileURL && !isAlreadyInDirectory($0, directory: target)
-        }
-        guard !files.isEmpty else { return false }
-
-        Task { @MainActor in
-            let conflicts = FileTransfer.conflicts(urls: files, to: target)
-            guard !conflicts.isEmpty else {
-                await performCopy(files: files, target: target, policy: .skip)
-                return
+    @ViewBuilder
+    private var dialogButtons: some View {
+        if let content = pane.dialogs.content {
+            switch content {
+            case .conflict(let prompt):
+                Button(prompt.presentation.skipButtonTitle) {
+                    prompt.resolve(.skip)
+                }
+                Button(prompt.presentation.overwriteButtonTitle, role: .destructive) {
+                    prompt.resolve(.overwrite)
+                }
+                Button("取消", role: .cancel) {
+                    pane.dialogs.dismiss()
+                }
+            case .result:
+                Button("好", role: .cancel) {
+                    pane.dialogs.dismiss()
+                }
             }
-            activeDialog = .conflict(PendingDropConflict(
-                files: files,
-                target: target,
-                presentation: FileConflictPresentation(conflicts: conflicts, totalCount: files.count)
-            ))
         }
-        return true
-    }
-
-    /// 用户在窗口内告警框里做出选择后继续复制。
-    private func resolveConflict(_ pending: PendingDropConflict, policy: FileTransferConflictPolicy) {
-        activeDialog = nil
-        // 让告警框先退场，避免紧接着的结果提示被系统丢掉
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            await performCopy(files: pending.files, target: pending.target, policy: policy)
-        }
-    }
-
-    @MainActor
-    private func performCopy(files: [URL], target: URL, policy: FileTransferConflictPolicy) async {
-        let result = await FileTransfer.perform(
-            urls: files,
-            to: target,
-            mode: .copy,
-            conflictPolicy: policy
-        )
-        if !result.succeeded.isEmpty {
-            pane.refresh()
-        }
-        guard !result.failures.isEmpty else { return }
-
-        if files.count == 1, let failure = result.failures.first {
-            activeDialog = .result(
-                title: "复制失败",
-                message: "「\(failure.name)」：\(failure.reason)"
-            )
-            return
-        }
-
-        let title = result.succeeded.isEmpty && result.skipped.isEmpty ? "操作失败" : "部分项目失败"
-        var counts: [String] = []
-        if !result.succeeded.isEmpty { counts.append("成功 \(result.succeeded.count) 项") }
-        if !result.skipped.isEmpty { counts.append("跳过 \(result.skipped.count) 项") }
-        counts.append("失败 \(result.failures.count) 项")
-
-        let details = result.failures.prefix(6)
-            .map { "\($0.name)：\($0.reason)" }
-            .joined(separator: "\n")
-        let more = result.failures.count > 6 ? "\n…" : ""
-        activeDialog = .result(
-            title: title,
-            message: "\(counts.joined(separator: "，"))。\n\(details)\(more)"
-        )
-    }
-
-    private func isAlreadyInDirectory(_ url: URL, directory: URL) -> Bool {
-        url.deletingLastPathComponent().standardizedFileURL.path(percentEncoded: false)
-            == directory.standardizedFileURL.path(percentEncoded: false)
     }
 }
 
@@ -211,6 +123,8 @@ private struct PaneBodyView: View {
                     preview: preview,
                     onRefresh: { pane.refresh() },
                     directory: pane.currentDirectory,
+                    pane: pane,
+                    renameRequest: pane.renameRequest,
                     sortField: pane.sortField,
                     sortOrder: pane.sortOrder,
                     onSortChange: handleSortChange,
@@ -232,8 +146,9 @@ private struct PaneBodyView: View {
                     quickAccess: quickAccess,
                     staging: staging,
                     preview: preview,
-                    onRefresh: { pane.refresh() },
-                    directory: pane.currentDirectory
+                    directory: pane.currentDirectory,
+                    pane: pane,
+                    renameRequest: pane.renameRequest
                 )
                 .equatable()
 
@@ -299,6 +214,10 @@ private struct PaneBodyView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
         .onTapGesture { onActivate() }
+        // 空目录也要能右键新建/粘贴，否则「空文件夹」反而是唯一没法往里放东西的地方
+        .contextMenu {
+            DirectoryContextMenu(pane: pane, directory: pane.currentDirectory)
+        }
     }
 
     private func handleDoubleClick(_ file: FileItem) {

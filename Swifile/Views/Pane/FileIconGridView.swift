@@ -16,8 +16,11 @@ struct FileIconGridView: View, Equatable {
     let quickAccess: QuickAccessManager
     let staging: StagingState
     let preview: PreviewState
-    let onRefresh: () -> Void
     let directory: URL
+    /// 窗格状态：粘贴、制作副本、重命名等动作需要回写告警框与选中
+    let pane: PaneState
+    /// 行内改名请求：由窗格发起，本视图负责落到具体那一格
+    let renameRequest: PaneState.RenameRequest?
 
     /// 列数按最小宽度自适应，列宽再均匀拉伸铺满整行（访达同款），
     /// 不会在两侧留下成片的居中留白。
@@ -25,8 +28,11 @@ struct FileIconGridView: View, Equatable {
     private let columns = [GridItem(.adaptive(minimum: 96), spacing: 12)]
 
     /// 选择由单元格独立观察；焦点状态不影响网格内容，因此不参与比较。
+    /// 改名请求必须参与：它决定哪一格要切成输入框。
     nonisolated static func == (lhs: FileIconGridView, rhs: FileIconGridView) -> Bool {
-        lhs.paneId == rhs.paneId && lhs.fileGeneration == rhs.fileGeneration
+        lhs.paneId == rhs.paneId &&
+            lhs.fileGeneration == rhs.fileGeneration &&
+            lhs.renameRequest?.token == rhs.renameRequest?.token
     }
 
     var body: some View {
@@ -43,7 +49,8 @@ struct FileIconGridView: View, Equatable {
                         quickAccess: quickAccess,
                         staging: staging,
                         preview: preview,
-                        onRefresh: onRefresh
+                        pane: pane,
+                        renameRequest: renameRequest
                     )
                 }
             }
@@ -58,7 +65,7 @@ struct FileIconGridView: View, Equatable {
         }
         // 网格空白区域：给针对当前目录的操作（单元格上的菜单优先）
         .contextMenu {
-            DirectoryContextMenu(directory: directory) { onRefresh() }
+            DirectoryContextMenu(pane: pane, directory: directory)
         }
     }
 }
@@ -83,12 +90,18 @@ private struct IconCell: View {
     let quickAccess: QuickAccessManager
     let staging: StagingState
     let preview: PreviewState
-    let onRefresh: () -> Void
+    let pane: PaneState
+    let renameRequest: PaneState.RenameRequest?
 
     /// 图标绘制尺寸（对齐访达的大图标档）
     private static let iconSize: CGFloat = 64
 
     @State private var icon: NSImage?
+
+    /// 本格是否正处于行内改名
+    private var isRenaming: Bool {
+        renameRequest?.url == file.url
+    }
 
     /// 自判双击用：上次单击的时刻与落点
     @State private var lastClickTime: TimeInterval = 0
@@ -114,7 +127,8 @@ private struct IconCell: View {
         quickAccess: QuickAccessManager,
         staging: StagingState,
         preview: PreviewState,
-        onRefresh: @escaping () -> Void
+        pane: PaneState,
+        renameRequest: PaneState.RenameRequest?
     ) {
         self.file = file
         self.fileGeneration = fileGeneration
@@ -125,7 +139,8 @@ private struct IconCell: View {
         self.quickAccess = quickAccess
         self.staging = staging
         self.preview = preview
-        self.onRefresh = onRefresh
+        self.pane = pane
+        self.renameRequest = renameRequest
         // 命中缓存时直接作为初始值，省掉「先占位图、再重绘真实图标」的一轮
         _icon = State(
             initialValue: IconService.shared.cached(
@@ -143,9 +158,28 @@ private struct IconCell: View {
             iconView
                 .frame(width: 64, height: 64)
 
-            // 名称颜色下沉到子视图：选择变化只重算这一个 Text，
-            // 格子的 body 不再依赖选择集合，点击不会连带重算整个可见网格。
-            IconNameLabel(name: file.name, url: file.url, selectionStore: selectionStore)
+            // 进入改名时把名称换成输入框，位置与字号保持一致
+            if isRenaming, let request = renameRequest {
+                InlineRenameField(
+                    initialName: request.initialName,
+                    isDirectory: file.isDirectory,
+                    fontSize: 12,
+                    height: 18,
+                    onCommit: { name in
+                        pane.consumeRenameRequest(token: request.token)
+                        PaneOperations.rename(file.url, to: name, in: pane)
+                    },
+                    onCancel: {
+                        pane.consumeRenameRequest(token: request.token)
+                    }
+                )
+                .frame(height: 18)
+                .padding(.horizontal, 2)
+            } else {
+                // 名称颜色下沉到子视图：选择变化只重算这一个 Text，
+                // 格子的 body 不再依赖选择集合，点击不会连带重算整个可见网格。
+                IconNameLabel(name: file.name, url: file.url, selectionStore: selectionStore)
+            }
         }
         .padding(6)
         // 宽度跟随网格列宽：固定宽度一旦超过列宽，选中背景会贴边被裁掉
@@ -161,7 +195,7 @@ private struct IconCell: View {
             .padding(2)
         )
         .contentShape(Rectangle())
-        // 按下即选中 + 松手时自判双击。
+        // 按下即选中 + 松手时自判双击。改名期间不再响应，输入框里要能点选、拖选文字。
         // 双 click 不再用 onTapGesture(count: 2)：它与按下手势同时识别时，
         // 双击序列里的回调会被扣到系统判定结束才发出。
         // 自判的间隔用系统设置（NSEvent.doubleClickInterval）、落点要求接近，语义与系统一致。
@@ -170,6 +204,7 @@ private struct IconCell: View {
         .simultaneousGesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { value in
+                    guard !isRenaming else { return }
                     // 零距离拖拽的第一次回调一定带 translation == .zero，拿它当按下瞬间的判据
                     guard value.translation == .zero else { return }
                     // 先落选中再切焦点：焦点切换会带一轮窗口重绘，排在选中之前反馈会慢半拍
@@ -181,6 +216,7 @@ private struct IconCell: View {
                     onActivate()
                 }
                 .onEnded { value in
+                    guard !isRenaming else { return }
                     // 移动超过微小抖动的算拖拽，不参与点击判定
                     guard abs(value.translation.width) < 4, abs(value.translation.height) < 4 else { return }
                     let now = ProcessInfo.processInfo.systemUptime
@@ -208,12 +244,11 @@ private struct IconCell: View {
         }
         .contextMenu {
             FileContextMenu(
+                pane: pane,
                 files: [file],
                 staging: staging,
                 preview: preview,
-                quickAccess: quickAccess,
-                onOpenDirectory: onDoubleClick,
-                onRefresh: onRefresh
+                quickAccess: quickAccess
             )
         }
     }
