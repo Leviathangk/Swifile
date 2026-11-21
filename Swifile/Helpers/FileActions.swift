@@ -308,6 +308,19 @@ enum FileMenuCommand: String {
 
     var isDestructive: Bool { self == .moveToTrash }
 
+    /// 菜单里显示的快捷键提示。空串表示不显示。
+    /// 这些键本身由 FileEditHotkeys 全局接管，这里只是让菜单上能看到「有快捷键」。
+    var keyEquivalent: String {
+        switch self {
+        case .copy: return "c"
+        case .cut: return "x"
+        case .paste: return "v"
+        case .duplicate: return "d"
+        case .moveToTrash: return "\u{8}"
+        default: return ""
+        }
+    }
+
     /// AppKit 菜单项图标：与 SwiftUI 侧读同一个 SF Symbol 名。
     /// 统一到 16pt 见方，菜单行高才不会因图标尺寸不同而跳动。
     var menuImage: NSImage? {
@@ -319,10 +332,61 @@ enum FileMenuCommand: String {
     }
 }
 
+// MARK: - 右键菜单排版
+
+/// 菜单里的一个位置：一条命令或一条分隔线。
+enum FileMenuSlot: Hashable {
+    case command(FileMenuCommand)
+    case separator
+}
+
+/// 右键菜单的分组与顺序：三种视图唯一的排版来源。
+///
+/// 列表视图的菜单是 AppKit 的 NSMenu，图标与分栏视图是 SwiftUI 菜单。
+/// 两边如果各自排一遍顺序，就会像之前那样：加一条命令漏掉一边，
+/// 或者同一条命令在两个视图里位置不同。这里只定义一次。
+///
+/// 分组原则是「一个分组一个意图」，用户按意图找，而不是按我们写代码的顺序找：
+///   打开 → 改动它 → 定位它 → 收集它 → 删除它
+enum FileMenuLayout {
+    /// 行菜单：右击文件或文件夹。
+    /// `拷贝`/`剪切`/`粘贴` 与 `制作副本` 相邻——它们都是「弄出另一份」，
+    /// 之前被 `重命名` 隔开，找起来要跳。
+    static let fileGroups: [[FileMenuCommand]] = [
+        [.open, .openWith, .quickLook],
+        [.rename, .duplicate, .copy, .cut, .paste],
+        [.copyPath, .revealInFinder, .openInTerminal],
+        [.addToQuickAccess, .addToStaging],
+        [.moveToTrash],
+    ]
+
+    /// 空白区域菜单：作用于当前目录本身。
+    /// `拷贝路径` 与「在终端中打开」「在 Finder 中显示」同组：
+    /// 三条都是「去别处操作这个目录」，不是剪贴板动作。
+    static let directoryGroups: [[FileMenuCommand]] = [
+        [.newFolder, .paste],
+        [.openWith, .openInTerminal, .revealInFinder, .copyPath],
+        [.refresh],
+    ]
+
+    /// 把分组摊平成 AppKit 与 SwiftUI 都能顺序消费的一串位置。
+    static func slots(for groups: [[FileMenuCommand]]) -> [FileMenuSlot] {
+        var result: [FileMenuSlot] = []
+        for (index, group) in groups.enumerated() {
+            if index > 0 { result.append(.separator) }
+            result.append(contentsOf: group.map(FileMenuSlot.command))
+        }
+        return result
+    }
+
+    static var fileSlots: [FileMenuSlot] { slots(for: fileGroups) }
+    static var directorySlots: [FileMenuSlot] { slots(for: directoryGroups) }
+}
+
 // MARK: - 文件右键菜单
 
 /// 文件右键菜单：列视图与图标视图共用，动作全部走 FileActions / PaneOperations。
-/// 列表视图因为宿主是 NSTableView，仍用 AppKit 菜单，但同样按 FileMenuCommand 渲染。
+/// 列表视图因为宿主是 NSTableView，仍用 AppKit 菜单，但同样按 FileMenuLayout 渲染。
 struct FileContextMenu: View {
     let pane: PaneState
     let files: [FileItem]
@@ -337,70 +401,77 @@ struct FileContextMenu: View {
     }
 
     var body: some View {
-        FileMenuButton(command: .open) {
-            FileActions.open(files) { pane.navigate(to: $0.url) }
-        }
-        if !files.isEmpty {
-            OpenWithMenu(urls: files.map(\.url))
-        }
-        FileMenuButton(command: .quickLook) {
-            if let first = files.first {
-                preview.item = first
+        ForEach(Array(FileMenuLayout.fileSlots.enumerated()), id: \.offset) { _, slot in
+            switch slot {
+            case .separator:
+                Divider()
+            case .command(let command):
+                entry(for: command)
             }
         }
+    }
 
-        Divider()
-
-        FileMenuButton(command: .revealInFinder) {
-            FileActions.revealInFinder(files)
-        }
-        FileMenuButton(command: .openInTerminal) {
-            guard let first = files.first else { return }
-            FileActions.openInTerminal(first)
-        }
-
-        Divider()
-
-        FileMenuButton(command: .copy) {
-            FileActions.copy(files)
-        }
-        FileMenuButton(command: .cut) {
-            FileActions.cut(files)
-        }
-        if let pasteTarget {
-            FileMenuButton(command: .paste) {
-                PaneOperations.paste(into: pane, directory: pasteTarget)
+    /// 每条命令的按钮。顺序与分组由 FileMenuLayout 决定，这里只负责「这一条怎么点」。
+    @ViewBuilder
+    private func entry(for command: FileMenuCommand) -> some View {
+        switch command {
+        case .open:
+            FileMenuButton(command: .open) {
+                FileActions.open(files) { pane.navigate(to: $0.url) }
             }
-            .disabled(!FileClipboard.hasFiles)
-        }
-        FileMenuButton(command: .copyPath) {
-            FileActions.copyPaths(files)
-        }
-
-        Divider()
-
-        if files.count == 1, let first = files.first {
-            FileMenuButton(command: .rename) {
-                pane.requestRename(url: first.url, initialName: first.name)
+        case .openWith:
+            if !files.isEmpty {
+                OpenWithMenu(urls: files.map(\.url))
             }
-        }
-        FileMenuButton(command: .duplicate) {
-            PaneOperations.duplicate(files, in: pane)
-        }
-
-        Divider()
-
-        FileMenuButton(command: .addToQuickAccess) {
-            FileActions.addToQuickAccess(files, manager: quickAccess)
-        }
-        FileMenuButton(command: .addToStaging) {
-            FileActions.addToStaging(files, staging: staging)
-        }
-
-        Divider()
-
-        FileMenuButton(command: .moveToTrash) {
-            FileActions.moveToTrash(files) { pane.refresh() }
+        case .quickLook:
+            FileMenuButton(command: .quickLook) {
+                if let first = files.first { preview.item = first }
+            }
+        case .rename:
+            if files.count == 1, let first = files.first {
+                FileMenuButton(command: .rename) {
+                    pane.requestRename(url: first.url, initialName: first.name)
+                }
+            }
+        case .duplicate:
+            FileMenuButton(command: .duplicate) {
+                PaneOperations.duplicate(files, in: pane)
+            }
+        case .copy:
+            FileMenuButton(command: .copy) { FileActions.copy(files) }
+        case .cut:
+            FileMenuButton(command: .cut) { FileActions.cut(files) }
+        case .paste:
+            // 只有右击单个文件夹才有粘贴目标；右击文件时不显示（与访达一致）
+            if let pasteTarget {
+                FileMenuButton(command: .paste) {
+                    PaneOperations.paste(into: pane, directory: pasteTarget)
+                }
+                .disabled(!FileClipboard.hasFiles)
+            }
+        case .copyPath:
+            FileMenuButton(command: .copyPath) { FileActions.copyPaths(files) }
+        case .revealInFinder:
+            FileMenuButton(command: .revealInFinder) { FileActions.revealInFinder(files) }
+        case .openInTerminal:
+            FileMenuButton(command: .openInTerminal) {
+                guard let first = files.first else { return }
+                FileActions.openInTerminal(first)
+            }
+        case .addToQuickAccess:
+            FileMenuButton(command: .addToQuickAccess) {
+                FileActions.addToQuickAccess(files, manager: quickAccess)
+            }
+        case .addToStaging:
+            FileMenuButton(command: .addToStaging) {
+                FileActions.addToStaging(files, staging: staging)
+            }
+        case .moveToTrash:
+            FileMenuButton(command: .moveToTrash) {
+                FileActions.moveToTrash(files) { pane.refresh() }
+            }
+        case .newFolder, .copyDirectoryPath, .refresh, .openWithOther:
+            EmptyView()
         }
     }
 }
@@ -414,34 +485,45 @@ struct DirectoryContextMenu: View {
     let directory: URL
 
     var body: some View {
-        FileMenuButton(command: .newFolder) {
-            PaneOperations.createFolder(in: pane, directory: directory)
+        ForEach(Array(FileMenuLayout.directorySlots.enumerated()), id: \.offset) { _, slot in
+            switch slot {
+            case .separator:
+                Divider()
+            case .command(let command):
+                entry(for: command)
+            }
         }
-        FileMenuButton(command: .paste) {
-            PaneOperations.paste(into: pane, directory: directory)
-        }
-        .disabled(!FileClipboard.hasFiles)
+    }
 
-        Divider()
-
-        FileMenuButton(command: .revealInFinder) {
-            FileActions.reveal(directory)
-        }
-        FileMenuButton(command: .openInTerminal) {
-            FileActions.openInTerminal(at: directory)
-        }
-        OpenWithMenu(urls: [directory])
-
-        Divider()
-
-        FileMenuButton(command: .copyDirectoryPath) {
-            FileActions.copyPath(directory)
-        }
-
-        Divider()
-
-        FileMenuButton(command: .refresh) {
-            pane.refresh()
+    /// 空白区域菜单的条目。顺序与分组由 FileMenuLayout 决定。
+    @ViewBuilder
+    private func entry(for command: FileMenuCommand) -> some View {
+        switch command {
+        case .newFolder:
+            FileMenuButton(command: .newFolder) {
+                PaneOperations.createFolder(in: pane, directory: directory)
+            }
+        case .paste:
+            FileMenuButton(command: .paste) {
+                PaneOperations.paste(into: pane, directory: directory)
+            }
+            .disabled(!FileClipboard.hasFiles)
+        case .openWith:
+            OpenWithMenu(urls: [directory])
+        case .openInTerminal:
+            FileMenuButton(command: .openInTerminal) {
+                FileActions.openInTerminal(at: directory)
+            }
+        case .revealInFinder:
+            FileMenuButton(command: .revealInFinder) { FileActions.reveal(directory) }
+        case .copyPath, .copyDirectoryPath:
+            FileMenuButton(command: .copyDirectoryPath) {
+                FileActions.copyPath(directory)
+            }
+        case .refresh:
+            FileMenuButton(command: .refresh) { pane.refresh() }
+        default:
+            EmptyView()
         }
     }
 }

@@ -229,43 +229,20 @@ struct FileTableView: NSViewRepresentable, Equatable {
         }
     }
 
-    /// 列表视图的行右键菜单。标题、图标、顺序都取自 FileMenuCommand，
-    /// 与列视图、图标视图的 SwiftUI 菜单共用同一份定义。
+    /// 列表视图的行右键菜单。顺序、分组、标题、图标、快捷键都取自 FileMenuLayout 与
+    /// FileMenuCommand，与列视图、图标视图的 SwiftUI 菜单共用同一份定义。
     private func createContextMenu(coordinator: Coordinator) -> NSMenu {
         let menu = NSMenu()
         menu.delegate = coordinator
 
-        func item(_ command: FileMenuCommand, _ action: Selector, key: String = "") -> NSMenuItem {
-            let i = NSMenuItem(title: command.title, action: action, keyEquivalent: key)
-            i.target = coordinator
-            i.image = command.menuImage
-            // 记录命令身份：菜单展开时按它统一刷新可用性
-            i.representedObject = command.rawValue
-            return i
+        for slot in FileMenuLayout.fileSlots {
+            switch slot {
+            case .separator:
+                menu.addItem(.separator())
+            case .command(let command):
+                menu.addItem(coordinator.makeRowMenuItem(command))
+            }
         }
-
-        menu.addItem(item(.open, #selector(Coordinator.menuOpen(_:))))
-        menu.addItem(coordinator.makeRowOpenWithItem())
-        menu.addItem(item(.quickLook, #selector(Coordinator.menuQuickLook(_:))))
-        menu.addItem(.separator())
-        menu.addItem(item(.revealInFinder, #selector(Coordinator.menuRevealInFinder(_:))))
-        menu.addItem(item(.openInTerminal, #selector(Coordinator.menuOpenInTerminal(_:))))
-        menu.addItem(.separator())
-        menu.addItem(item(.copy, #selector(Coordinator.menuCopy(_:)), key: "c"))
-        menu.addItem(item(.cut, #selector(Coordinator.menuCut(_:)), key: "x"))
-        menu.addItem(item(.paste, #selector(Coordinator.menuPaste(_:)), key: "v"))
-        menu.addItem(item(.copyPath, #selector(Coordinator.menuCopyPath(_:))))
-        menu.addItem(.separator())
-        menu.addItem(item(.rename, #selector(Coordinator.menuRename(_:))))
-        menu.addItem(item(.duplicate, #selector(Coordinator.menuDuplicate(_:)), key: "d"))
-        menu.addItem(.separator())
-
-        // 快速访问是单一扁平列表，直接用一个菜单项添加
-        menu.addItem(item(.addToQuickAccess, #selector(Coordinator.menuAddToQuickAccess(_:))))
-        menu.addItem(item(.addToStaging, #selector(Coordinator.menuAddToStaging(_:))))
-
-        menu.addItem(.separator())
-        menu.addItem(item(.moveToTrash, #selector(Coordinator.menuMoveToTrash(_:)), key: "\u{8}"))
         return menu
     }
 
@@ -819,31 +796,90 @@ struct FileTableView: NSViewRepresentable, Equatable {
 
         // MARK: - Context menu
 
-        /// 空白区域菜单：作用于当前目录本身
+        /// 空白区域菜单：作用于当前目录本身。
+        /// 顺序与分组同样来自 FileMenuLayout，和行菜单、SwiftUI 菜单保持一致。
         func makeDirectoryMenu() -> NSMenu {
-            // 空白区域菜单也要在展开时刷新可用性（粘贴依赖剪贴板）
             let menu = NSMenu()
             menu.delegate = self
 
-            func item(_ command: FileMenuCommand, _ action: Selector, key: String = "") -> NSMenuItem {
-                let i = NSMenuItem(title: command.title, action: action, keyEquivalent: key)
-                i.target = self
-                i.image = command.menuImage
-                i.representedObject = command.rawValue
-                return i
+            for slot in FileMenuLayout.directorySlots {
+                switch slot {
+                case .separator:
+                    menu.addItem(.separator())
+                case .command(let command):
+                    menu.addItem(makeDirectoryMenuItem(command))
+                }
             }
-
-            menu.addItem(item(.newFolder, #selector(menuCreateFolder(_:))))
-            menu.addItem(item(.paste, #selector(menuPasteIntoDirectory(_:))))
-            menu.addItem(.separator())
-            menu.addItem(item(.revealInFinder, #selector(menuRevealDirectory(_:))))
-            menu.addItem(item(.openInTerminal, #selector(menuOpenDirectoryInTerminal(_:))))
-            menu.addItem(makeDirectoryOpenWithItem())
-            menu.addItem(.separator())
-            menu.addItem(item(.copyDirectoryPath, #selector(menuCopyDirectoryPath(_:))))
-            menu.addItem(.separator())
-            menu.addItem(item(.refresh, #selector(menuRefresh(_:))))
             return menu
+        }
+
+        // MARK: 菜单项构造
+
+        /// 行菜单的一条命令。命令 → 动作的映射集中在这里，
+        /// 排版变了只需要改 FileMenuLayout，不会漏掉某个视图。
+        func makeRowMenuItem(_ command: FileMenuCommand) -> NSMenuItem {
+            if command == .openWith {
+                return makeRowOpenWithItem()
+            }
+            let item = NSMenuItem(
+                title: command.title,
+                action: rowSelector(for: command),
+                keyEquivalent: command.keyEquivalent
+            )
+            item.target = self
+            item.image = command.menuImage
+            // 记录命令身份：菜单展开时按它统一刷新可用性
+            item.representedObject = command.rawValue
+            return item
+        }
+
+        private func rowSelector(for command: FileMenuCommand) -> Selector? {
+            switch command {
+            case .open: return #selector(menuOpen(_:))
+            case .quickLook: return #selector(menuQuickLook(_:))
+            case .rename: return #selector(menuRename(_:))
+            case .duplicate: return #selector(menuDuplicate(_:))
+            case .copy: return #selector(menuCopy(_:))
+            case .cut: return #selector(menuCut(_:))
+            case .paste: return #selector(menuPaste(_:))
+            case .copyPath: return #selector(menuCopyPath(_:))
+            case .revealInFinder: return #selector(menuRevealInFinder(_:))
+            case .openInTerminal: return #selector(menuOpenInTerminal(_:))
+            case .addToQuickAccess: return #selector(menuAddToQuickAccess(_:))
+            case .addToStaging: return #selector(menuAddToStaging(_:))
+            case .moveToTrash: return #selector(menuMoveToTrash(_:))
+            default: return nil
+            }
+        }
+
+        /// 空白区域菜单的一条命令
+        private func makeDirectoryMenuItem(_ command: FileMenuCommand) -> NSMenuItem {
+            if command == .openWith {
+                return makeDirectoryOpenWithItem()
+            }
+            let selector: Selector?
+            switch command {
+            case .newFolder: selector = #selector(menuCreateFolder(_:))
+            case .paste: selector = #selector(menuPasteIntoDirectory(_:))
+            case .openInTerminal: selector = #selector(menuOpenDirectoryInTerminal(_:))
+            case .revealInFinder: selector = #selector(menuRevealDirectory(_:))
+            case .copyPath, .copyDirectoryPath: selector = #selector(menuCopyDirectoryPath(_:))
+            case .refresh: selector = #selector(menuRefresh(_:))
+            default: selector = nil
+            }
+            // 目录菜单里的「拷贝路径」用目录版本，标题也不同
+            let title = command == .copyPath
+                ? FileMenuCommand.copyDirectoryPath.title
+                : command.title
+            let item = NSMenuItem(
+                title: title,
+                action: selector,
+                keyEquivalent: command.keyEquivalent
+            )
+            item.target = self
+            item.image = command.menuImage
+            item.representedObject = command.rawValue
+            return item
         }
 
         // MARK: 打开方式子菜单
@@ -914,15 +950,21 @@ struct FileTableView: NSViewRepresentable, Equatable {
             }
         }
 
-        /// 行菜单的可用性：粘贴依赖剪贴板，重命名只对单项开放。
+        /// 行菜单的可用性。
+        /// 粘贴只有在「右击单个文件夹」时才出现（粘进那个文件夹），
+        /// 右击文件时没有合理的粘贴目标——与 SwiftUI 版菜单的规则保持一致。
         private func updateRowMenuItems(_ menu: NSMenu) {
             let canPaste = FileClipboard.hasFiles
-            let single = contextFiles.count == 1
+            let selected = contextFiles
+            let single = selected.count == 1
+            let pasteTargetIsFolder = single && (selected.first?.isDirectory ?? false)
             for item in menu.items {
                 switch FileMenuCommand(rawValue: item.representedObject as? String ?? "") {
                 case .paste:
+                    item.isHidden = !pasteTargetIsFolder
                     item.isEnabled = canPaste
                 case .rename:
+                    item.isHidden = false
                     item.isEnabled = single
                 default:
                     break
