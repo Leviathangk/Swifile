@@ -90,12 +90,17 @@ final class AppStateManager {
     let favorites = SidebarFavoritesSettings()
 
     @ObservationIgnored private var parkedPanes: [PaneState] = []
+    /// 当前这次容量读取；切换目录时取消上一次，避免旧卷的结果覆盖新卷
+    @ObservationIgnored private var diskUsageReadTask: Task<Void, Never>?
+    /// 低频刷新循环：容量会随文件写入变化，不只在切换卷时更新
+    @ObservationIgnored private var diskUsageRefreshTask: Task<Void, Never>?
 
     init() {
         let initialPane = PaneState(directory: FileManager.default.homeDirectoryForCurrentUser)
         self.panes = [initialPane]
         self.paneFocus = PaneFocus(activePane: initialPane)
-        refreshDiskUsage()
+        refreshDiskUsage(for: initialPane.currentDirectory)
+        startDiskUsageRefreshLoop()
     }
 
     /// 设置窗格布局，并复用已创建的窗格状态。
@@ -127,17 +132,37 @@ final class AppStateManager {
         }
     }
 
-    private func refreshDiskUsage() {
-        Task { [weak self] in
+    /// 按目录所在卷刷新可用容量。活动窗格切换目录、切换窗格、挂载变化和应用回到前台时调用。
+    func refreshDiskUsage(for directory: URL) {
+        diskUsageReadTask?.cancel()
+        let path = directory.path(percentEncoded: false)
+        diskUsageReadTask = Task { [weak self] in
             let values = await Task.detached(priority: .utility) {
-                let homePath = FileManager.default.homeDirectoryForCurrentUser.path(percentEncoded: false)
-                let attributes = try? FileManager.default.attributesOfFileSystem(forPath: homePath)
+                let attributes = try? FileManager.default.attributesOfFileSystem(forPath: path)
                 let total = (attributes?[.systemSize] as? NSNumber)?.int64Value ?? 0
                 let free = (attributes?[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
                 return (total: total, used: max(0, total - free))
             }.value
-            self?.diskTotal = values.total
-            self?.diskUsed = values.used
+            guard !Task.isCancelled, let self else { return }
+            // 路径暂时不可读（磁盘正在卸载等）时保留上一次的有效值
+            guard values.total > 0 else { return }
+            // 同值不写回，避免无谓的界面重绘
+            if self.diskTotal != values.total || self.diskUsed != values.used {
+                self.diskTotal = values.total
+                self.diskUsed = values.used
+            }
+        }
+    }
+
+    /// 每 30 秒核对一次当前卷容量；一次文件系统属性读取，主线程开销可忽略
+    private func startDiskUsageRefreshLoop() {
+        guard !PerfHarness.isEnabled else { return }
+        diskUsageRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                guard !Task.isCancelled, let self else { return }
+                self.refreshDiskUsage(for: self.paneFocus.activePane.currentDirectory)
+            }
         }
     }
 }

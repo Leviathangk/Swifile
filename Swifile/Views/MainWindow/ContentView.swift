@@ -91,14 +91,34 @@ struct ContentView: View {
         }
         .onAppear {
             appState.loadAllPanes()
+            appState.refreshDiskUsage(for: appState.paneFocus.activePane.currentDirectory)
             // 自动化性能基准（SWIFILE_PERF_BENCH=1）
             PerfHarness.runIfNeeded(appState: appState)
+        }
+        // 状态栏容量跟随活动窗格所在卷：切换目录或切换窗格时立即刷新
+        .onChange(of: appState.paneFocus.activePane.currentDirectory) { _, directory in
+            appState.refreshDiskUsage(for: directory)
+        }
+        .onChange(of: appState.paneFocus.activePaneId) { _, _ in
+            appState.refreshDiskUsage(for: appState.paneFocus.activePane.currentDirectory)
+        }
+        // 挂载/卸载会改变可用卷列表与当前卷状态
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+            for: NSWorkspace.didMountNotification
+        )) { _ in
+            appState.refreshDiskUsage(for: appState.paneFocus.activePane.currentDirectory)
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+            for: NSWorkspace.didUnmountNotification
+        )) { _ in
+            appState.refreshDiskUsage(for: appState.paneFocus.activePane.currentDirectory)
         }
         // 兜底同步：应用回到前台时，检查目录是否在监听之外发生过变化
         .onReceive(NotificationCenter.default.publisher(
             for: NSApplication.didBecomeActiveNotification
         )) { _ in
             appState.panes.forEach { $0.refreshIfDirectoryChangedExternally() }
+            appState.refreshDiskUsage(for: appState.paneFocus.activePane.currentDirectory)
         }
         // 空格呼出的应用内悬浮预览（与分栏预览列共用 FilePreviewPanel 组件）
         .overlay {
